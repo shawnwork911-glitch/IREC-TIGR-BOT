@@ -49,9 +49,9 @@ def upload():
     file_size_kb = len(file_bytes) / 1024
     print(f"  Size   : {file_size_kb:.1f} KB")
 
-    # Name the file with today's date so old files are not overwritten
+    # Name the file so old files are overwritten
     today       = datetime.now().strftime("%Y-%m-%d")
-    remote_name = f"combined_output_{today}.xlsx"
+    remote_name = "combined_output.xlsx"
     print(f"  Sending as: {remote_name}")
 
     # POST to Power Automate
