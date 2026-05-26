@@ -18,7 +18,8 @@ jobs:
   run-bot:
     runs-on: ubuntu-latest
     timeout-minutes: 30       # kill the job if it hangs beyond 30 min
-
+    env:
+         FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
 
       # ── 1. Check out your repo ──────────────────────────────────────────────
