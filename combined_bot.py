@@ -1,0 +1,1330 @@
+"""
+Combined Bot
+============
+Runs both workflows sequentially using a single .env file:
+
+  1. IREC Holdings Bot  — logs into evident.app, downloads CSVs for each account
+  2. TIGR Registry Bot  — logs into tigrsregistry.apx.com, downloads Excel sub-account reports
+  3. Combine Output     — merges all downloaded files into a single Excel using the template
+
+.env keys used
+--------------
+  IREC_EMAIL          Email for evident.app
+  IREC_PASSWORD       Password for evident.app
+  HEADLESS            (optional) true/false — default false
+
+  TIGR_MYUSERNAME     Username for TIGR "MY" account
+  TIGR_MYPASSWORD     Password for TIGR "MY" account
+  TIGR_SGUSERNAME     (optional) Username for TIGR "SG" account
+  TIGR_SGPASSWORD     (optional) Password for TIGR "SG" account
+
+Requirements:
+  pip install playwright python-dotenv openpyxl pandas
+  python -m playwright install chromium
+
+Output Template Columns (hardcoded):
+  Registry | Asset ID | Asset | Country | Fuel | Tech | TIGR Vintage |
+  Period Start | Period End | Quantity | Transferor | Feed-in Tariff |
+  Sub-Account | Sub-Account ID
+"""
+
+import os
+import sys
+import time
+import logging
+import traceback
+import calendar
+from pathlib import Path
+from datetime import datetime, date
+
+# ── Keep window open on crash ─────────────────────────────────────────────────
+def _fatal(msg=""):
+    if msg:
+        print(msg)
+    print("\n" + "=" * 60)
+    input("  Press Enter to close this window...")
+    sys.exit(1)
+
+sys.excepthook = lambda t, v, tb: (
+    print("\n[CRASH] An unexpected error occurred:\n"),
+    traceback.print_exception(t, v, tb),
+    input("\n  Press Enter to close this window..."),
+)
+
+# ── Imports ───────────────────────────────────────────────────────────────────
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    _fatal(
+        "[ERROR] 'python-dotenv' is not installed.\n"
+        "  Run:  pip install playwright python-dotenv openpyxl pandas\n"
+        "  Then: python -m playwright install chromium"
+    )
+
+try:
+    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+except ImportError:
+    _fatal(
+        "[ERROR] 'playwright' is not installed.\n"
+        "  Run:  pip install playwright python-dotenv openpyxl pandas\n"
+        "  Then: python -m playwright install chromium"
+    )
+
+try:
+    import pandas as pd
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+except ImportError:
+    _fatal(
+        "[ERROR] 'openpyxl' or 'pandas' is not installed.\n"
+        "  Run:  pip install openpyxl pandas"
+    )
+
+# ── Shared config ─────────────────────────────────────────────────────────────
+load_dotenv()
+
+DOWNLOAD_DIR   = Path("downloads")
+LOG_DIR        = Path("logs")
+SCREENSHOT_DIR = Path("screenshots")
+OUTPUT_DIR     = Path("output")
+for d in (DOWNLOAD_DIR, LOG_DIR, SCREENSHOT_DIR, OUTPUT_DIR):
+    d.mkdir(exist_ok=True)
+
+HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
+
+# ── Hardcoded Output Template Columns ─────────────────────────────────────────
+TEMPLATE_COLUMNS = [
+    "Registry",
+    "Asset ID",
+    "Asset",
+    "Country",
+    "Fuel",
+    "Tech",
+    "Period Start",
+    "Period End",
+    "Quantity",
+    "Transferor",
+    "Feed-in Tariff",
+    "Sub-Account",
+    "Sub-Account ID",
+]
+
+# ── IREC column mapping ───────────────────────────────────────────────────────
+# IREC CSV columns → Template columns
+# Device       → Asset ID
+# Device Name  → Asset
+# Fuel type    → Fuel
+# Technology   → Tech
+# Country      → Country (first 2 chars)
+# Volume       → Quantity
+IREC_COLUMN_MAP = {
+    "Device":       "Asset ID",
+    "Device Name":  "Asset",
+    "Fuel type":    "Fuel",
+    "Technology":   "Tech",
+    "Country":      "Country",
+    "Volume":       "Quantity",
+}
+
+# ── TIGR country name → ISO 2-letter code ────────────────────────────────────
+TIGR_COUNTRY_MAP = {
+    "viet nam":   "VN",
+    "vietnam":    "VN",
+    "malaysia":   "MY",
+    "singapore":  "SG",
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  LOGGING
+# ─────────────────────────────────────────────────────────────────────────────
+def setup_logging() -> logging.Logger:
+    ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = LOG_DIR / f"combined_bot_{ts}.log"
+    fmt      = "%(asctime)s  [%(levelname)-8s]  %(message)s"
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format=fmt,
+        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[
+            logging.FileHandler(log_file, encoding="utf-8"),
+            logging.StreamHandler(sys.stdout),
+        ],
+    )
+    logger = logging.getLogger("combined_bot")
+    logger.info("Log file: %s", log_file)
+    return logger
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  SHARED HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+def banner(msg):
+    print(f"\n{'═' * 60}\n  {msg}\n{'═' * 60}")
+
+def step(msg):
+    print(f"\n{'─' * 60}\n  {msg}\n{'─' * 60}")
+
+def screenshot(page, name: str, logger: logging.Logger):
+    ts   = datetime.now().strftime("%H%M%S")
+    path = SCREENSHOT_DIR / f"{ts}_{name}.png"
+    try:
+        page.screenshot(path=str(path), full_page=True)
+        logger.debug("Screenshot → %s", path)
+    except Exception as exc:
+        logger.warning("Screenshot failed '%s': %s", name, exc)
+
+def all_frames(page):
+    return [page.main_frame] + [f for f in page.frames if f != page.main_frame]
+
+def click_in_any_frame(page, selectors, label, logger, timeout=6_000):
+    frames = all_frames(page)
+    logger.debug("Searching %d frame(s) for: %s", len(frames), label)
+    for sel in selectors:
+        for frame in frames:
+            try:
+                el = frame.wait_for_selector(sel, timeout=timeout, state="visible")
+                if el:
+                    logger.debug("  ✓ '%s' found in frame '%s' via: %s", label, frame.url[:80], sel)
+                    el.click()
+                    return frame, el
+            except PWTimeout:
+                continue
+            except Exception as exc:
+                logger.debug("  Error sel='%s' frame='%s': %s", sel, frame.url[:60], exc)
+    return None, None
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  BOT 1 — IREC Holdings (evident.app)
+# ═════════════════════════════════════════════════════════════════════════════
+
+IREC_LOGIN_URL = "https://evident.app/login"
+
+# (search_term, account_code, account_name_link, file_label, click_name_header)
+IREC_TARGET_ACCOUNTS = [
+    ("SAXONTRADE01",  "SAXONTRADE01", "SaxonTrade01",             "SaxonTrade01",                  False),
+    ("FRG",           "T0LFRGI4",     "Saxon Renewables Pte Ltd", "SaxonRenewablesPteLtd_T0LFRGI4", False),
+]
+
+
+def irec_validate_env():
+    email    = os.getenv("IREC_EMAIL")
+    password = os.getenv("IREC_PASSWORD")
+    missing  = [k for k, v in {"IREC_EMAIL": email, "IREC_PASSWORD": password}.items() if not v]
+    if missing:
+        _fatal(
+            f"\n[ERROR] Missing IREC credential(s) in .env: {', '.join(missing)}\n"
+            "  Add to your .env file:\n"
+            "    IREC_EMAIL=you@example.com\n"
+            "    IREC_PASSWORD=your_password\n"
+        )
+    return email, password
+
+
+def irec_login(page, email, password):
+    step("IREC — Logging in ...")
+    page.goto(IREC_LOGIN_URL, wait_until="networkidle")
+
+    for loc, label, err_msg in [
+        ('input[type="email"], input[name="email"], input[placeholder*="email" i]',
+         "email", "[ERROR] IREC email field not found."),
+        ('input[type="password"], input[name="password"]',
+         "password", "[ERROR] IREC password field not found."),
+    ]:
+        try:
+            f = page.locator(loc).first
+            f.wait_for(state="visible", timeout=10_000)
+            f.fill(email if label == "email" else password)
+            print(f"  [✓] {label.capitalize()} entered")
+        except PWTimeout:
+            _fatal(err_msg)
+
+    try:
+        b = page.locator('button[type="submit"], button:has-text("Log in"), button:has-text("Sign in")').first
+        b.wait_for(state="visible", timeout=5_000)
+        b.click()
+        print("  [✓] Submit clicked")
+    except PWTimeout:
+        _fatal("[ERROR] IREC submit button not found.")
+
+    try:
+        page.wait_for_url(lambda url: "/login" not in url, timeout=15_000)
+        print(f"  [✓] Logged in → {page.url}")
+    except PWTimeout:
+        err = page.locator('[class*="error"],[class*="alert"],[role="alert"]')
+        msg = err.first.text_content().strip() if err.count() > 0 else "no error text visible"
+        _fatal(f"[FAILED] IREC login rejected: {msg}\nCheck IREC_EMAIL / IREC_PASSWORD in .env.")
+
+
+def irec_go_to_accounts(page):
+    step("IREC — Navigating to Accounts ...")
+    try:
+        link = page.locator('nav a:has-text("Accounts"), aside a:has-text("Accounts"), a:has-text("Accounts")').first
+        link.wait_for(state="visible", timeout=10_000)
+        link.click()
+        page.wait_for_selector('text="Account Code"', timeout=15_000)
+        print("  [✓] Accounts page loaded")
+    except PWTimeout:
+        _fatal("[ERROR] Could not load the IREC Accounts page.")
+
+
+def irec_search_accounts(page, search_term, account_code):
+    step(f"IREC — Searching for: '{search_term}'")
+    try:
+        sb = page.locator('input[placeholder*="Search" i], input[type="search"]').first
+        sb.wait_for(state="visible", timeout=10_000)
+        sb.click()
+        sb.press("Control+a")
+        sb.press("Backspace")
+        sb.type(search_term, delay=80)
+        print(f"  [✓] Typed '{search_term}'")
+    except PWTimeout:
+        _fatal("[ERROR] IREC search box not found.")
+
+    try:
+        page.wait_for_selector(f'text="{account_code}"', timeout=15_000)
+        page.wait_for_timeout(1_000)
+        print(f"  [✓] Account code '{account_code}' visible")
+    except PWTimeout:
+        _fatal(f"[ERROR] Account '{account_code}' not found after searching '{search_term}'.")
+
+
+def irec_click_account_name(page, account_name, click_name_header=False):
+    step(f"IREC — Clicking account: '{account_name}'")
+    if click_name_header:
+        try:
+            lnk = page.locator('a:has-text("Account Name"), span:has-text("Account Name"), th:has-text("Account Name")').first
+            lnk.wait_for(state="visible", timeout=10_000)
+            lnk.click()
+            page.wait_for_load_state("networkidle", timeout=15_000)
+            print("  [✓] Clicked 'Account Name' header")
+        except PWTimeout:
+            _fatal("[ERROR] 'Account Name' link/element not found.")
+
+    try:
+        nl = page.locator(f'a:has-text("{account_name}")').first
+        nl.wait_for(state="visible", timeout=10_000)
+        nl.click()
+        print(f"  [✓] Clicked '{account_name}'")
+    except PWTimeout:
+        _fatal(f"[ERROR] Account name link '{account_name}' not found.")
+
+    try:
+        page.wait_for_load_state("networkidle", timeout=15_000)
+        print(f"  [✓] Account detail loaded → {page.url}")
+    except PWTimeout:
+        _fatal(f"[ERROR] Account detail page did not load for '{account_name}'.")
+
+
+def irec_click_view_holdings(page, account_name):
+    step("IREC — Clicking 'View Account Holdings' ...")
+    try:
+        btn = page.locator(
+            'a:has-text("View Account Holdings"), button:has-text("View Account Holdings"), '
+            'a:has-text("Account Holdings"), button:has-text("Account Holdings")'
+        ).first
+        btn.wait_for(state="visible", timeout=15_000)
+        btn.click()
+        print("  [✓] 'View Account Holdings' clicked")
+    except PWTimeout:
+        _fatal(f"[ERROR] 'View Account Holdings' not found for '{account_name}'.")
+
+    try:
+        page.wait_for_load_state("networkidle", timeout=15_000)
+        print(f"  [✓] Holdings page loaded → {page.url}")
+    except PWTimeout:
+        _fatal(f"[ERROR] Holdings page did not load for '{account_name}'.")
+
+
+def irec_download_csv(page, search_term, account_code, account_name, label, click_name_header=False):
+    irec_go_to_accounts(page)
+    irec_search_accounts(page, search_term, account_code)
+    irec_click_account_name(page, account_name, click_name_header=click_name_header)
+    irec_click_view_holdings(page, account_name)
+
+    step("IREC — Waiting for Account Holdings table ...")
+    try:
+        page.wait_for_selector('text="Account Holdings"', timeout=15_000)
+        page.wait_for_load_state("networkidle", timeout=15_000)
+        page.wait_for_timeout(1_500)
+        print("  [✓] Holdings table ready")
+    except PWTimeout:
+        _fatal(f"[ERROR] Holdings table did not load for '{account_name}'.")
+
+    step(f"IREC — Downloading CSV for '{account_name}' ...")
+    try:
+        csv_btn = page.locator('button:has-text("CSV"), a:has-text("CSV")').first
+        csv_btn.wait_for(state="visible", timeout=15_000)
+        with page.expect_download(timeout=30_000) as dl_info:
+            csv_btn.click()
+        save_path = DOWNLOAD_DIR / f"{label}_holdings.csv"
+        if save_path.exists():
+            save_path.unlink()
+            print(f"  [i] Replaced existing file: {save_path.name}")
+        dl_info.value.save_as(str(save_path))
+        print(f"  [✓] CSV saved → {save_path}")
+        return save_path
+    except PWTimeout:
+        _fatal(f"[ERROR] CSV button not found or download timed out for '{account_name}'.")
+
+
+def irec_logout(page):
+    step("IREC — Logging out ...")
+    try:
+        btn = page.locator('a:has-text("Log Out"), button:has-text("Log Out")').first
+        btn.wait_for(state="visible", timeout=10_000)
+        btn.click()
+        page.wait_for_url(lambda url: "/login" in url or url.endswith("/"), timeout=10_000)
+        print("  [✓] Logged out")
+    except PWTimeout:
+        print("  [!] Log Out button not found — skipping.")
+
+
+def run_irec(logger):
+    banner("BOT 1 — IREC Holdings (evident.app)")
+    email, password = irec_validate_env()
+
+    saved_files = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=HEADLESS)
+        context = browser.new_context(accept_downloads=True)
+        page    = context.new_page()
+
+        irec_login(page, email, password)
+
+        for search_term, account_code, account_name, label, click_name_header in IREC_TARGET_ACCOUNTS:
+            try:
+                path = irec_download_csv(
+                    page, search_term, account_code, account_name, label, click_name_header
+                )
+                saved_files.append((account_name, path, None))
+            except SystemExit:
+                saved_files.append((account_name, None, "fatal error (see above)"))
+
+        irec_logout(page)
+        browser.close()
+
+    return saved_files
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  BOT 2 — TIGR Registry (tigrsregistry.apx.com)
+# ═════════════════════════════════════════════════════════════════════════════
+
+TIGR_URL     = "https://tigrsregistry.apx.com/mymodule/mypage.asp"
+TIGR_TIMEOUT = 30_000
+TIGR_NAV_TO  = 60_000
+TIGR_SLOW_MO = 300
+
+
+def tigr_load_env(logger):
+    account_defs = [
+        ("MY Account", "TIGR_MYUSERNAME", "TIGR_MYPASSWORD"),
+        ("SG Account", "TIGR_SGUSERNAME", "TIGR_SGPASSWORD"),
+    ]
+    accounts = []
+    for label, u_var, p_var in account_defs:
+        u = os.getenv(u_var, "").strip()
+        p = os.getenv(p_var, "").strip()
+        if u and p:
+            accounts.append((label, u, p))
+            logger.info("TIGR credentials loaded: [%s] user='%s'", label, u)
+        else:
+            logger.warning("TIGR: skipping [%s] — %s or %s not set.", label, u_var, p_var)
+
+    if not accounts:
+        logger.error(
+            "No TIGR credentials found in .env.\n"
+            "Add at least one pair:\n"
+            "  TIGR_MYUSERNAME=...  TIGR_MYPASSWORD=...\n"
+            "  TIGR_SGUSERNAME=...  TIGR_SGPASSWORD=..."
+        )
+        return []
+    logger.info("TIGR accounts to process: %d", len(accounts))
+    return accounts
+
+
+def tigr_find_login_frame(page, logger):
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        for frame in all_frames(page):
+            try:
+                if frame.query_selector('input[type="password"]'):
+                    logger.info("TIGR password input found in frame: %s", frame.url[:80])
+                    return frame
+            except Exception:
+                pass
+        logger.debug("TIGR: no password field yet, waiting 1 s…")
+        time.sleep(1)
+
+    logger.error("TIGR: no password input found after 15 s. Frames:")
+    for f in all_frames(page):
+        logger.error("  %s", f.url)
+    return None
+
+
+def tigr_login(page, username, password, logger):
+    logger.info("TIGR STEP 1 — Opening %s", TIGR_URL)
+    page.goto(TIGR_URL, timeout=TIGR_NAV_TO, wait_until="domcontentloaded")
+    logger.info("TIGR page title: %s", page.title())
+    screenshot(page, "tigr_01_opened", logger)
+
+    logger.info("TIGR STEP 2 — Logging in as '%s'", username)
+    time.sleep(2)
+
+    frame = tigr_find_login_frame(page, logger)
+    if frame is None:
+        screenshot(page, "tigr_error_no_login_form", logger)
+        raise RuntimeError("TIGR: could not find login form (no password input).")
+
+    text_inputs     = frame.query_selector_all('input[type="text"], input[type="email"], input:not([type])')
+    password_inputs = frame.query_selector_all('input[type="password"]')
+
+    if not text_inputs:
+        text_inputs = [
+            el for el in frame.query_selector_all("input")
+            if (el.get_attribute("type") or "text") not in
+               ("password", "submit", "button", "checkbox", "radio", "hidden", "image")
+        ]
+
+    if not text_inputs:
+        screenshot(page, "tigr_error_no_username_field", logger)
+        raise RuntimeError("TIGR: no username input found.")
+    if not password_inputs:
+        screenshot(page, "tigr_error_no_password_field", logger)
+        raise RuntimeError("TIGR: no password input found.")
+
+    u_field = text_inputs[0]
+    p_field = password_inputs[0]
+    u_field.click(); u_field.fill(""); u_field.type(username, delay=60)
+    p_field.click(); p_field.fill(""); p_field.type(password, delay=60)
+    screenshot(page, "tigr_02_credentials_filled", logger)
+
+    login_selectors = [
+        'a:has-text("Login")', 'button:has-text("Login")', 'input[value="Login"]',
+        'a:has-text("Log In")', 'button:has-text("Log In")', 'input[value="Log In"]',
+        'a:has-text("Sign In")', 'button:has-text("Sign In")', 'input[value="Sign In"]',
+        'input[type="submit"]', 'button[type="submit"]', 'button',
+    ]
+    submitted = False
+    for sel in login_selectors:
+        try:
+            btn = frame.wait_for_selector(sel, timeout=3_000, state="visible")
+            if btn:
+                btn.click()
+                submitted = True
+                logger.info("TIGR: clicked login button via selector '%s'", sel)
+                break
+        except PWTimeout:
+            continue
+        except Exception as exc:
+            logger.warning("TIGR: could not click '%s': %s", sel, exc)
+
+    if not submitted:
+        logger.warning("TIGR: no login button found — pressing Enter.")
+        p_field.press("Enter")
+
+    try:
+        page.wait_for_load_state("networkidle", timeout=TIGR_NAV_TO)
+    except PWTimeout:
+        logger.warning("TIGR: networkidle timeout after login, continuing…")
+
+    logger.info("TIGR: after login URL: %s", page.url)
+    screenshot(page, "tigr_03_after_login", logger)
+
+    try:
+        body = page.inner_text("body").lower()
+    except Exception:
+        body = ""
+    for phrase in ("invalid username", "invalid password", "incorrect password",
+                   "login failed", "authentication failed", "access denied"):
+        if phrase in body:
+            screenshot(page, "tigr_error_login_failed", logger)
+            raise RuntimeError(
+                f"TIGR login failed — page says '{phrase}'. "
+                "Check TIGR_MYUSERNAME / TIGR_MYPASSWORD in .env."
+            )
+    logger.info("TIGR: login successful.")
+
+
+def tigr_click_reports(page, logger):
+    logger.info("TIGR STEP 3 — Clicking 'Reports'")
+    selectors = [
+        'a:has-text("Reports")', 'button:has-text("Reports")', 'input[value="Reports"]',
+        'a:has-text("Report")', 'button:has-text("Report")',
+        '[id*="report" i]', '[class*="report" i]', 'a[href*="report" i]',
+    ]
+    _, el = click_in_any_frame(page, selectors, "Reports", logger)
+    if not el:
+        screenshot(page, "tigr_error_no_reports", logger)
+        raise RuntimeError("TIGR: 'Reports' button not found.")
+    time.sleep(1.5)
+    screenshot(page, "tigr_04_reports_open", logger)
+    logger.info("TIGR: Reports menu opened.")
+
+
+def tigr_click_sub_accounts(page, logger):
+    logger.info("TIGR STEP 4 — Clicking 'My Sub-Accounts'")
+    selectors = [
+        'a:has-text("My Sub-Accounts")', 'li:has-text("My Sub-Accounts")',
+        'button:has-text("My Sub-Accounts")', 'td:has-text("My Sub-Accounts")',
+        'a:has-text("Sub-Accounts")', 'a:has-text("Sub-Account")',
+        ':has-text("My Sub-Accounts")',
+    ]
+    _, el = click_in_any_frame(page, selectors, "My Sub-Accounts", logger)
+    if not el:
+        screenshot(page, "tigr_error_no_sub_accounts", logger)
+        raise RuntimeError("TIGR: 'My Sub-Accounts' not found.")
+
+    try:
+        page.wait_for_load_state("networkidle", timeout=TIGR_NAV_TO)
+    except PWTimeout:
+        logger.warning("TIGR: networkidle timeout, continuing…")
+    time.sleep(1)
+    screenshot(page, "tigr_05_sub_accounts_loaded", logger)
+    logger.info("TIGR: Sub-Accounts loaded. URL: %s", page.url)
+
+
+def tigr_click_active(page, logger):
+    logger.info("TIGR STEP 5 — Clicking 'Active' filter")
+    selectors = [
+        'input[value="Active"]', 'button:has-text("Active")',
+        'a:has-text("Active")', 'td:has-text("Active")',
+        'label:has-text("Active")', '[id*="active" i]',
+    ]
+    _, el = click_in_any_frame(page, selectors, "Active", logger)
+    if not el:
+        screenshot(page, "tigr_error_no_active", logger)
+        raise RuntimeError("TIGR: 'Active' filter not found.")
+    time.sleep(2)
+    screenshot(page, "tigr_06_active_applied", logger)
+    logger.info("TIGR: 'Active' filter applied.")
+
+
+def tigr_download(page, label, logger) -> Path:
+    logger.info("TIGR STEP 6 — Downloading Excel file")
+    DOWNLOAD_DIR.mkdir(exist_ok=True)
+
+    selectors_ordered = [
+        'a[href*=".xls"]', 'a[href*="excel" i]', 'a[href*="Export" i]', 'a[href*="download" i]',
+        'a img[alt*="excel" i]', 'a img[alt*="download" i]', 'a img[alt*="export" i]',
+        'a img[src*="excel" i]', 'a img[src*="xls" i]', 'a img[src*="download" i]',
+        '[id*="excel" i]', '[id*="export" i]', '[id*="download" i]',
+        '[class*="excel" i]', '[class*="export" i]',
+        '[title*="excel" i]', '[title*="download" i]', '[title*="export" i]',
+    ]
+
+    found_frame = None
+    found_el    = None
+    frames      = all_frames(page)
+
+    for sel in selectors_ordered:
+        for frame in frames:
+            try:
+                el = frame.wait_for_selector(sel, timeout=3_000, state="visible")
+                if el:
+                    found_frame = frame
+                    found_el    = el
+                    logger.info("TIGR: download icon found via selector: %s", sel)
+                    break
+            except PWTimeout:
+                continue
+            except Exception as exc:
+                logger.debug("TIGR: sel='%s' error: %s", sel, exc)
+        if found_el:
+            break
+
+    if not found_el:
+        logger.warning("TIGR: keyword selectors failed — trying positional fallback.")
+        for frame in frames:
+            try:
+                anchors      = frame.query_selector_all("a")
+                icon_anchors = [
+                    a for a in anchors
+                    if not (a.inner_text() or "").strip() and a.query_selector("img")
+                ]
+                logger.info("TIGR: icon-style anchors found: %d", len(icon_anchors))
+                if len(icon_anchors) >= 2:
+                    found_el    = icon_anchors[1]
+                    found_frame = frame
+                    logger.info("TIGR: using positional fallback icon[1]")
+                    break
+                elif len(icon_anchors) == 1:
+                    found_el    = icon_anchors[0]
+                    found_frame = frame
+                    logger.warning("TIGR: only 1 icon anchor found — clicking it.")
+                    break
+            except Exception as exc:
+                logger.debug("TIGR: positional fallback error: %s", exc)
+
+    if not found_el:
+        screenshot(page, "tigr_error_no_download_button", logger)
+        raise RuntimeError("TIGR: could not find the Excel download icon.")
+
+    logger.info("TIGR: triggering download…")
+    with page.expect_download(timeout=60_000) as dl_info:
+        found_el.click()
+
+    dl        = dl_info.value
+    save_path = DOWNLOAD_DIR / f"temp_{label.replace(' ', '_')}.csv"
+    if save_path.exists():
+        save_path.unlink()
+        logger.info("TIGR: removed old file: %s", save_path)
+    dl.save_as(str(save_path))
+
+    logger.info("TIGR ✅ File downloaded → %s", save_path.resolve())
+    screenshot(page, "tigr_07_download_complete", logger)
+    return save_path
+
+
+def tigr_logout(page, logger):
+    logger.info("TIGR STEP 7 — Logging out")
+    selectors = [
+        'a:has-text("Logout")', 'a:has-text("Log Out")', 'a:has-text("Log off")',
+        'a:has-text("Sign Out")', 'button:has-text("Logout")', 'button:has-text("Log Out")',
+        '[id*="logout" i]', '[href*="logout" i]', '[href*="logoff" i]', '[href*="signout" i]',
+    ]
+    _, el = click_in_any_frame(page, selectors, "Logout", logger)
+    if not el:
+        screenshot(page, "tigr_error_no_logout", logger)
+        raise RuntimeError("TIGR: Logout button not found.")
+
+    try:
+        page.wait_for_load_state("networkidle", timeout=TIGR_NAV_TO)
+    except PWTimeout:
+        logger.warning("TIGR: networkidle timeout after logout, continuing…")
+
+    logger.info("TIGR: logged out. URL: %s", page.url)
+    screenshot(page, "tigr_08_logged_out", logger)
+    time.sleep(1)
+
+
+def tigr_run_account(page, label, username, password, logger):
+    logger.info("━" * 60)
+    logger.info("  TIGR ACCOUNT: %s  (user: %s)", label, username)
+    logger.info("━" * 60)
+
+    tigr_login(page, username, password, logger)
+    tigr_click_reports(page, logger)
+    tigr_click_sub_accounts(page, logger)
+    tigr_click_active(page, logger)
+    saved = tigr_download(page, label, logger)
+    tigr_logout(page, logger)
+
+    logger.info("TIGR ✅  [%s] Done. File: %s", label, saved.resolve())
+    return saved
+
+
+def run_tigr(logger):
+    banner("BOT 2 — TIGR Registry (tigrsregistry.apx.com)")
+    accounts = tigr_load_env(logger)
+    if not accounts:
+        logger.error("No TIGR accounts configured — skipping TIGR bot.")
+        return []
+
+    results = []
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(
+            headless=HEADLESS,
+            slow_mo=TIGR_SLOW_MO,
+            downloads_path=str(DOWNLOAD_DIR.resolve()),
+        )
+        context = browser.new_context(
+            accept_downloads=True,
+            viewport={"width": 1280, "height": 900},
+        )
+        page = context.new_page()
+        page.on("console",   lambda m: logger.debug("[browser] %s: %s", m.type, m.text))
+        page.on("pageerror", lambda e: logger.error("[page error] %s", e))
+
+        for idx, (label, username, password) in enumerate(accounts, start=1):
+            logger.info("TIGR: processing account %d/%d: %s", idx, len(accounts), label)
+            try:
+                saved = tigr_run_account(page, label, username, password, logger)
+                results.append((label, saved, None))
+            except (RuntimeError, PWTimeout, Exception) as exc:
+                logger.error("TIGR ❌  [%s] FAILED: %s", label, exc)
+                screenshot(page, f"tigr_error_{label.replace(' ', '_')}", logger)
+                results.append((label, None, str(exc)))
+                try:
+                    logger.info("TIGR: recovering — navigating to login page…")
+                    page.goto(TIGR_URL, timeout=TIGR_NAV_TO, wait_until="domcontentloaded")
+                    time.sleep(2)
+                except Exception as nav_exc:
+                    logger.error("TIGR: recovery failed: %s", nav_exc)
+
+        context.close()
+        browser.close()
+
+    return results
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  BOT 3 — COMBINE OUTPUT
+# ═════════════════════════════════════════════════════════════════════════════
+
+def swap_month_day(date_val):
+    """
+    Swap month and day in a date value.
+    Input:  6/1/2026  (month=6, day=1)  → Output: 1/6/2026  (month=1, day=6)
+    Handles datetime objects, date objects, and string representations.
+    Returns a date object with month and day swapped.
+    """
+    if date_val is None:
+        return None
+    # Normalise to a date/datetime
+    if isinstance(date_val, (datetime, date)):
+        d = date_val if isinstance(date_val, date) else date_val.date()
+        # Swap: new month = old day, new day = old month
+        try:
+            return date(d.year, d.day, d.month)
+        except ValueError:
+            return None
+    # Try to parse string
+    val = str(date_val).strip()
+    for fmt in ("%m/%d/%Y", "%d/%m/%Y", "%Y-%m-%d", "%m-%d-%Y"):
+        try:
+            d = datetime.strptime(val, fmt).date()
+            return date(d.year, d.day, d.month)
+        except ValueError:
+            continue
+    return None
+
+
+def last_day_of_month(d):
+    """Return a date for the last day of the month that d falls in."""
+    if d is None:
+        return None
+    _, last_day = calendar.monthrange(d.year, d.month)
+    return date(d.year, d.month, last_day)
+
+
+def map_tigr_country(country_val):
+    """Map TIGR country names to 2-letter codes."""
+    if country_val is None:
+        return None
+    key = str(country_val).strip().lower()
+    return TIGR_COUNTRY_MAP.get(key, str(country_val).strip())
+
+
+def irec_country_to_code(country_val):
+    """Take the first 2 characters of the IREC country field."""
+    if country_val is None:
+        return None
+    return str(country_val).strip()[:2].upper()
+
+
+def _make_getter(row, columns):
+    """
+    Return a case-insensitive column getter for a single row.
+    Defined outside the loop to avoid the Python closure-capture bug
+    where inner functions in loops capture the loop variable by reference.
+    """
+    col_map = {c.strip().lower(): c for c in columns}
+    def get(col):
+        actual = col_map.get(col.strip().lower())
+        if actual is None:
+            return None
+        v = row[actual]
+        return None if pd.isna(v) else str(v).strip()
+    return get
+
+
+def _find_header_row(path, required_keywords, max_scan=10):
+    """
+    Scan the first max_scan rows of an Excel file to find the real header row.
+    Returns the 0-based row index where the header lives, or 0 as fallback.
+    required_keywords: list of lowercase strings that should appear in the header row.
+    """
+    try:
+        raw = pd.read_excel(path, header=None, nrows=max_scan, dtype=str)
+        for i, row in raw.iterrows():
+            row_lower = [str(v).strip().lower() for v in row if pd.notna(v)]
+            if any(kw in row_lower for kw in required_keywords):
+                return i
+    except Exception:
+        pass
+    return 0
+
+
+def process_irec_files(irec_file_paths, logger):
+    """
+    Read all IREC CSV files and return a list of dicts matching TEMPLATE_COLUMNS.
+    IREC column mapping:
+        Device         → Asset ID
+        Device Name    → Asset
+        Fuel type      → Fuel
+        Technology     → Tech
+        Country        → Country (first 2 chars)
+        Volume         → Quantity
+        Period / Start → Period Start  (tries multiple common column names)
+        End / To       → Period End    (tries multiple common column names)
+    Registry = "IREC"
+    """
+    # Possible IREC column names for Period Start
+    IREC_START_ALIASES = [
+        "period start", "start date", "from", "date from", "reporting start",
+        "issue date", "issuance date", "period from", "valid from", "start",
+    ]
+    # Possible IREC column names for Period End
+    IREC_END_ALIASES = [
+        "period end", "end date", "to", "date to", "reporting end",
+        "expiry date", "period to", "valid to", "end",
+    ]
+    # Possible IREC column names for Fuel
+    IREC_FUEL_ALIASES = [
+        "fuel", "fuel type", "energy type", "source",
+    ]
+
+    rows = []
+    for path in irec_file_paths:
+        if path is None or not Path(path).exists():
+            logger.warning("IREC file not found, skipping: %s", path)
+            continue
+        try:
+            df = pd.read_csv(path, dtype=str)
+            logger.info("IREC file '%s': %d rows, columns: %s", path, len(df), list(df.columns))
+        except Exception as exc:
+            logger.error("Failed to read IREC file '%s': %s", path, exc)
+            continue
+
+        for _, row in df.iterrows():
+            get = _make_getter(row, df.columns)
+
+            period_start = next((get(a) for a in IREC_START_ALIASES if get(a)), None)
+            period_end   = next((get(a) for a in IREC_END_ALIASES   if get(a)), None)
+
+            def reformat_date(val):
+                """Convert any recognisable date string to DD/MM/YYYY."""
+                if not val:
+                    return val
+                from datetime import datetime
+                for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d"):
+                    try:
+                        return datetime.strptime(val.strip(), fmt).strftime("%d/%m/%Y")
+                    except ValueError:
+                        continue
+                return val  # return as-is if unrecognised
+
+            out = {col: None for col in TEMPLATE_COLUMNS}
+            out["Registry"]     = "IREC"
+            out["Asset ID"]     = get("Device")
+            out["Asset"]        = get("Device Name")
+            out["Fuel"]         = next((get(a) for a in IREC_FUEL_ALIASES if get(a)), None)
+            out["Tech"]         = get("Technology")
+            out["Country"]      = irec_country_to_code(get("Country"))
+            raw_qty = get("Volume")
+            out["Quantity"]     = float(raw_qty) if raw_qty else None
+            out["Period Start"] = reformat_date(period_start)
+            out["Period End"]   = reformat_date(period_end)
+            rows.append(out)
+
+    logger.info("IREC: total rows processed: %d", len(rows))
+    return rows
+
+
+def process_tigr_files(tigr_file_paths, logger):
+    """
+    Read all TIGR CSV files and return a list of dicts matching TEMPLATE_COLUMNS.
+    TIGR transformations:
+        Fuel Type    → Tech
+        TIGR Vintage → swap month/day → Period Start
+        Period End   = last day of Period Start month
+        Country      → map Viet Nam→VN, Malaysia→MY, Singapore→SG
+    Registry = "TIGR"
+    """
+    # All possible column name aliases for the Vintage field
+    VINTAGE_ALIASES = ["tigr vintage", "vintage", "period", "month", "issuance date", "issue date"]
+    # All possible column name aliases for the Quantity/Credits field
+    QUANTITY_ALIASES = ["quantity", "volume", "credits", "mwh", "amount", "certificates"]
+    # All possible column name aliases for the Fuel/Tech field
+    FUEL_ALIASES = ["fuel type", "fuel", "technology", "tech", "energy type"]
+
+    rows = []
+    for path in tigr_file_paths:
+        if path is None or not Path(path).exists():
+            logger.warning("TIGR file not found, skipping: %s", path)
+            continue
+
+        try:
+            df = pd.read_csv(path, dtype=str)
+            df.dropna(how="all", inplace=True)
+            df.reset_index(drop=True, inplace=True)
+            logger.info("TIGR file '%s': %d rows, columns: %s", path, len(df), list(df.columns))
+        except Exception as exc:
+            logger.error("Failed to read TIGR file '%s': %s", path, exc)
+            continue
+
+        for _, row in df.iterrows():
+            get = _make_getter(row, df.columns)
+
+            # Vintage: try multiple alias names
+            vintage_raw = None
+            for alias in VINTAGE_ALIASES:
+                vintage_raw = get(alias)
+                if vintage_raw:
+                    break
+
+            # Quantity: try multiple alias names
+            quantity_val = None
+            for alias in QUANTITY_ALIASES:
+                quantity_val = get(alias)
+                if quantity_val:
+                    break
+
+            # Fuel/Tech: read from file, fall back to "Solar Photovoltaics"
+            tech_val = None
+            for alias in FUEL_ALIASES:
+                tech_val = get(alias)
+                if tech_val:
+                    break
+            if not tech_val:
+                tech_val = "Solar Photovoltaics"
+
+            # Swap month↔day for Period Start, derive Period End
+            period_start = swap_month_day(vintage_raw)
+            period_end   = last_day_of_month(period_start)
+
+            def fmt_date(d):
+                if d is None:
+                    return None
+                return f"{d.month}/{d.day}/{d.year}"
+
+            out = {col: None for col in TEMPLATE_COLUMNS}
+            out["Registry"]     = "TIGR"
+            out["Fuel"]         = tech_val
+            out["Tech"]         = tech_val
+            out["Period Start"] = fmt_date(period_start)
+            out["Period End"]   = fmt_date(period_end)
+            out["Country"]      = map_tigr_country(get("Country"))
+            out["Quantity"]     = float(quantity_val) if quantity_val else None
+
+            # Pass through any remaining template columns that map directly
+            for col in TEMPLATE_COLUMNS:
+                if out[col] is None:
+                    out[col] = get(col)
+
+            rows.append(out)
+
+    logger.info("TIGR: total rows processed: %d", len(rows))
+    return rows
+
+
+def _apply_sheet_styles(ws, rows_data, col_widths, logger, is_previous=False):
+    """
+    Helper: write header + data rows with styling into a given worksheet.
+    `rows_data` is a list of dicts keyed by TEMPLATE_COLUMNS.
+    If `is_previous=True`, header uses a grey tone to visually distinguish it.
+    """
+    # ── Header styling ────────────────────────────────────────────────────────
+    if is_previous:
+        header_fill = PatternFill("solid", fgColor="5A5A5A")   # dark grey for Previous
+    else:
+        header_fill = PatternFill("solid", fgColor="1F4E79")   # dark blue for Current
+
+    header_font  = Font(bold=True, color="FFFFFF", size=11)
+    header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    thin_border  = Border(
+        left=Side(style="thin"),
+        right=Side(style="thin"),
+        top=Side(style="thin"),
+        bottom=Side(style="thin"),
+    )
+
+    for col_idx, col_name in enumerate(TEMPLATE_COLUMNS, start=1):
+        cell = ws.cell(row=1, column=col_idx, value=col_name)
+        cell.font      = header_font
+        cell.fill      = header_fill
+        cell.alignment = header_align
+        cell.border    = thin_border
+
+    # ── Row styling ───────────────────────────────────────────────────────────
+    if is_previous:
+        irec_fill = PatternFill("solid", fgColor="C8D8E8")   # muted blue for IREC (previous)
+        tigr_fill = PatternFill("solid", fgColor="C8E8C8")   # muted green for TIGR (previous)
+    else:
+        irec_fill = PatternFill("solid", fgColor="DDEEFF")   # light blue for IREC (current)
+        tigr_fill = PatternFill("solid", fgColor="DFFFDF")   # light green for TIGR (current)
+
+    row_align = Alignment(horizontal="left", vertical="center")
+
+    for row_idx, row_data in enumerate(rows_data, start=2):
+        registry = row_data.get("Registry", "")
+        fill     = irec_fill if registry == "IREC" else tigr_fill
+
+        for col_idx, col_name in enumerate(TEMPLATE_COLUMNS, start=1):
+            value = row_data.get(col_name)
+            cell  = ws.cell(row=row_idx, column=col_idx, value=value)
+            cell.fill   = fill
+            cell.border = thin_border
+            if col_name == "Quantity":
+                cell.alignment    = Alignment(horizontal="right", vertical="center")
+                cell.number_format = "#,##0.000000"
+            else:
+                cell.alignment = row_align
+
+    # ── Column widths ─────────────────────────────────────────────────────────
+    for col_idx, col_name in enumerate(TEMPLATE_COLUMNS, start=1):
+        ws.column_dimensions[get_column_letter(col_idx)].width = col_widths.get(col_name, 15)
+
+    # Freeze header row
+    ws.freeze_panes = "A2"
+
+
+def _load_previous_rows(prev_path, logger):
+    """
+    Read the 'Current' sheet from the previous combined_output.xlsx and return
+    its rows as a list of dicts keyed by TEMPLATE_COLUMNS.
+    Falls back to reading whichever sheet exists if 'Current' is absent.
+    """
+    try:
+        import openpyxl
+        wb_prev = openpyxl.load_workbook(str(prev_path), read_only=True, data_only=True)
+
+        # Prefer "Current", then "Combined" (legacy name), then first sheet
+        sheet_name = None
+        for candidate in ("Current", "Combined"):
+            if candidate in wb_prev.sheetnames:
+                sheet_name = candidate
+                break
+        if sheet_name is None:
+            sheet_name = wb_prev.sheetnames[0]
+
+        ws_prev = wb_prev[sheet_name]
+        rows_iter = ws_prev.iter_rows(values_only=True)
+
+        header = next(rows_iter, None)
+        if header is None:
+            logger.warning("Previous output sheet '%s' is empty.", sheet_name)
+            wb_prev.close()
+            return []
+
+        prev_rows = []
+        for row in rows_iter:
+            row_dict = {col: row[i] if i < len(row) else None
+                        for i, col in enumerate(header)}
+            # Re-key to TEMPLATE_COLUMNS so unknown columns are silently dropped
+            prev_rows.append({col: row_dict.get(col) for col in TEMPLATE_COLUMNS})
+
+        wb_prev.close()
+        logger.info("Loaded %d previous row(s) from '%s' (sheet: %s)",
+                    len(prev_rows), prev_path.name, sheet_name)
+        return prev_rows
+
+    except Exception as exc:
+        logger.warning("Could not read previous output '%s': %s — skipping comparison.", prev_path, exc)
+        return []
+
+
+def write_combined_excel(all_rows, logger):
+    """
+    Write all rows into a styled Excel file using the hardcoded template columns.
+
+    Behaviour
+    ---------
+    * The output is always saved as  output/combined_output.xlsx  (fixed name).
+    * If a previous  combined_output.xlsx  already exists in the output folder:
+        - Its data is loaded and written to a sheet named  "Previous"
+          (header in dark grey, rows in muted colours).
+        - The new data is written to a sheet named  "Current"
+          (header in dark blue, rows in the original colours).
+      The "Current" sheet is placed first so it opens by default.
+    * If no previous file exists, only the "Current" sheet is written.
+    * After saving, the fixed filename overwrites whatever was there before.
+
+    Columns not available in a source remain empty (None → blank cell).
+    """
+    output_path = OUTPUT_DIR / "combined_output.xlsx"
+
+    col_widths = {
+        "Registry":       12,
+        "Asset ID":       18,
+        "Asset":          30,
+        "Country":        10,
+        "Fuel":           18,
+        "Tech":           22,
+        "Period Start":   14,
+        "Period End":     14,
+        "Quantity":       14,
+        "Transferor":     20,
+        "Feed-in Tariff": 15,
+        "Sub-Account":    18,
+        "Sub-Account ID": 16,
+    }
+
+    # ── Load previous data if available ──────────────────────────────────────
+    prev_rows = []
+    if output_path.exists():
+        logger.info("Previous output found → loading for comparison: %s", output_path)
+        print(f"  [i] Previous output found — will add 'Previous' comparison sheet.")
+        prev_rows = _load_previous_rows(output_path, logger)
+    else:
+        logger.info("No previous output found — writing 'Current' sheet only.")
+        print(f"  [i] No previous output found — writing single 'Current' sheet.")
+
+    # ── Build workbook ────────────────────────────────────────────────────────
+    wb = Workbook()
+
+    # "Current" sheet — always first (active by default)
+    ws_current = wb.active
+    ws_current.title = "Current"
+    _apply_sheet_styles(ws_current, all_rows, col_widths, logger, is_previous=False)
+    logger.info("'Current' sheet written: %d row(s)", len(all_rows))
+
+    # "Previous" sheet — only when there was an existing file
+    if prev_rows:
+        ws_previous = wb.create_sheet(title="Previous")
+        _apply_sheet_styles(ws_previous, prev_rows, col_widths, logger, is_previous=True)
+        logger.info("'Previous' sheet written: %d row(s)", len(prev_rows))
+        print(f"  [i] 'Previous' sheet added with {len(prev_rows)} row(s) from prior run.")
+
+    # ── Save (overwrites the fixed filename) ─────────────────────────────────
+    wb.save(str(output_path))
+    logger.info("✅ Combined output saved → %s", output_path.resolve())
+    print(f"\n  ✅ Combined Excel saved → {output_path.resolve()}")
+    return output_path
+
+
+def detect_file_types(csv_paths, logger):
+    """
+    Open each CSV and inspect its headers to decide if it is an IREC or TIGR file.
+    IREC signature: contains 'device' and 'volume' column headers.
+    TIGR signature: contains 'vintage' or 'sub-account' column headers.
+    Unrecognised files are logged and skipped.
+    """
+    # IREC: has "device" column; TIGR: has "tigr vintage" or "sub-account" column
+    IREC_SIGNATURES = {"device"}
+    TIGR_SIGNATURES = {"tigr vintage", "sub-account", "vintage", "sub account", "subaccount"}
+
+    irec_paths = []
+    tigr_paths = []
+
+    for path in csv_paths:
+        try:
+            df_head = pd.read_csv(path, nrows=0, dtype=str)
+            headers = {c.strip().lower() for c in df_head.columns}
+        except Exception as exc:
+            logger.warning("detect_file_types: could not read '%s': %s", path, exc)
+            continue
+
+        if IREC_SIGNATURES & headers:
+            logger.info("  → IREC : %s  (headers: %s)", path, list(df_head.columns))
+            irec_paths.append(path)
+        elif TIGR_SIGNATURES & headers:
+            logger.info("  → TIGR : %s  (headers: %s)", path, list(df_head.columns))
+            tigr_paths.append(path)
+        else:
+            logger.warning("  → UNKNOWN (skipped): %s  (headers: %s)", path, list(df_head.columns))
+
+    logger.info("Detected %d IREC and %d TIGR file(s)", len(irec_paths), len(tigr_paths))
+    return irec_paths, tigr_paths
+
+
+def run_combine(irec_results, tigr_results, logger):
+    banner("BOT 3 — Combine Output")
+
+    # ── Scan the downloads folder directly ────────────────────────────────────────────
+    # CSV files → IREC; Excel files (.xlsx / .xls) → TIGR
+    # This is the source of truth regardless of what the bots returned above.
+    all_csvs = sorted([str(p) for p in DOWNLOAD_DIR.glob("*.csv") if p.is_file()])
+    logger.info("Downloads folder scan → %d CSV file(s) found", len(all_csvs))
+
+    if not all_csvs:
+        logger.warning("No CSV files found in downloads folder: %s", DOWNLOAD_DIR.resolve())
+        print(f"  [!] No CSV files found in {DOWNLOAD_DIR.resolve()} — nothing to combine.")
+        return None
+
+    irec_paths, tigr_paths = detect_file_types(all_csvs, logger)
+
+    irec_rows = process_irec_files(irec_paths, logger)
+    tigr_rows = process_tigr_files(tigr_paths, logger)
+
+    all_rows = irec_rows + tigr_rows
+    logger.info("Total rows to write: %d (%d IREC + %d TIGR)", len(all_rows), len(irec_rows), len(tigr_rows))
+
+    if not all_rows:
+        logger.warning("No data rows to write — skipping Excel output.")
+        print("  [!] No data to combine. Check that downloads succeeded.")
+        return None
+
+    return write_combined_excel(all_rows, logger)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  MAIN
+# ═════════════════════════════════════════════════════════════════════════════
+def main():
+    logger = setup_logging()
+    logger.info("=" * 60)
+    logger.info("Combined Bot — %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    logger.info("=" * 60)
+
+    # ── Run IREC ─────────────────────────────────────────────────────────────
+    irec_results = []
+    try:
+        irec_results = run_irec(logger)
+    except SystemExit:
+        logger.error("IREC bot exited early (fatal credential error).")
+    except Exception as exc:
+        logger.error("IREC bot crashed: %s", exc)
+
+    # ── Run TIGR ─────────────────────────────────────────────────────────────
+    tigr_results = []
+    try:
+        tigr_results = run_tigr(logger)
+    except SystemExit:
+        logger.error("TIGR bot exited early.")
+    except Exception as exc:
+        logger.error("TIGR bot crashed: %s", exc)
+
+    # ── Combine Output ────────────────────────────────────────────────────────
+    combined_path = None
+    try:
+        combined_path = run_combine(irec_results, tigr_results, logger)
+    except Exception as exc:
+        logger.error("Combine step crashed: %s", exc)
+        traceback.print_exc()
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    banner("FINAL SUMMARY")
+    all_ok = True
+
+    print("\n  ── IREC Holdings ──")
+    if not irec_results:
+        print("  [!] No IREC results (check credentials or errors above)")
+        all_ok = False
+    for account_name, path, err in irec_results:
+        if err:
+            print(f"  ❌  [{account_name}]  FAILED: {err}")
+            all_ok = False
+        else:
+            print(f"  ✅  [{account_name}]  → {path}")
+
+    print("\n  ── TIGR Registry ──")
+    if not tigr_results:
+        print("  [!] No TIGR results (check credentials or errors above)")
+        all_ok = False
+    for label, path, err in tigr_results:
+        if err:
+            print(f"  ❌  [{label}]  FAILED: {err}")
+            all_ok = False
+        else:
+            print(f"  ✅  [{label}]  → {path}")
+
+    print("\n  ── Combined Output ──")
+    if combined_path:
+        print(f"  ✅  Combined Excel → {combined_path}")
+    else:
+        print("  [!] Combined output not generated (no data or error above)")
+        all_ok = False
+
+    print(f"\n  Downloads in : {DOWNLOAD_DIR.resolve()}")
+    print(f"  Output in    : {OUTPUT_DIR.resolve()}")
+    print("=" * 60)
+    input("\n  Press Enter to close this window...")
+    sys.exit(0 if all_ok else 1)
+
+
+if __name__ == "__main__":
+    main()
