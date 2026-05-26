@@ -1,25 +1,18 @@
 name: Combined Bot — IREC + TIGR
 
 # ── Schedule: runs every Monday at 9:00 AM Malaysia time (UTC+8 = 01:00 UTC) ──
-# To change the schedule, edit the cron line below.
-# Cron format: minute hour day month weekday
-# Examples:
-#   '0 1 * * 1'   → Every Monday   9:00 AM MYT
-#   '0 1 * * *'   → Every day      9:00 AM MYT
-#   '0 1 1 * *'   → 1st of month   9:00 AM MYT
 on:
   schedule:
     - cron: '0 1 * * 1'
-
-  # Also allows you to run it manually from the GitHub Actions tab
   workflow_dispatch:
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 30       # kill the job if it hangs beyond 30 min
+    timeout-minutes: 30
     env:
-         FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true   # Node.js 24 fix
+
     steps:
 
       # ── 1. Check out your repo ──────────────────────────────────────────────
@@ -31,7 +24,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'          # caches pip downloads between runs (faster)
+          cache: 'pip'
 
       # ── 3. Install Python dependencies ──────────────────────────────────────
       - name: Install dependencies
@@ -39,17 +32,15 @@ jobs:
           pip install --upgrade pip
           pip install playwright python-dotenv openpyxl pandas msal requests
 
-      # ── 4. Install Playwright's Chromium browser ─────────────────────────────
+      # ── 4. Install Playwright Chromium browser ───────────────────────────────
       - name: Install Playwright browsers
         run: python -m playwright install chromium --with-deps
 
-      # ── 5. Create folders the bot expects ───────────────────────────────────
+      # ── 5. Create working directories ───────────────────────────────────────
       - name: Create working directories
         run: mkdir -p downloads logs screenshots output
 
-      # ── 6. Write credentials from GitHub Secrets into a .env file ───────────
-      #       Never put real passwords directly in this file!
-      #       They are stored securely in GitHub → Settings → Secrets.
+      # ── 6. Write credentials from GitHub Secrets into .env ──────────────────
       - name: Write .env from secrets
         run: |
           cat > .env << 'EOF'
@@ -65,13 +56,17 @@ jobs:
       # ── 7. Run the bot ───────────────────────────────────────────────────────
       - name: Run combined_bot.py
         run: python combined_bot_ci.py
-        # Uses combined_bot_ci.py (the CI-safe version without input() calls)
 
-      # ── 8. Upload output Excel as a downloadable artifact ───────────────────
-      #       You can download it from the GitHub Actions run page
-      #       It is kept for 30 days by default
-      - name: Upload output Excel
-        if: always()            # upload even if the bot had partial errors
+      # ── 8. Upload Excel to SharePoint via Power Automate ────────────────────
+      - name: Upload output to SharePoint (via Power Automate)
+        if: always()
+        env:
+          POWER_AUTOMATE_URL: ${{ secrets.POWER_AUTOMATE_URL }}
+        run: python upload_to_powerautomate.py
+
+      # ── 9. Keep a backup copy in GitHub artifacts (30 days) ─────────────────
+      - name: Upload output to GitHub artifacts (backup)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: combined-output-${{ github.run_number }}
@@ -80,7 +75,7 @@ jobs:
             logs/
           retention-days: 30
 
-      # ── 9. Upload screenshots (useful for debugging failures) ────────────────
+      # ── 10. Upload screenshots on failure for debugging ──────────────────────
       - name: Upload screenshots on failure
         if: failure()
         uses: actions/upload-artifact@v4
