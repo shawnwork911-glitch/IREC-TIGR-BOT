@@ -808,6 +808,44 @@ def map_tigr_country(country_val):
     return TIGR_COUNTRY_MAP.get(key, str(country_val).strip())
 
 
+def map_fuel_code(fuel_val, tech_val=None):
+    """
+    Map the Fuel column value to a short code for column E.
+
+    Rules (case-insensitive substring match):
+        Solar        → SLR
+        Biogas       → BIO
+        Biomass      → BMS
+        Geothermal   → GEO
+        Wind         → WND
+        Hydro-electric + Tech contains "Dam"          → LHY
+        Hydro-electric + Tech contains "Run of river" → SHYD
+
+    Returns the original value unchanged if no rule matches.
+    """
+    if fuel_val is None:
+        return None
+    fuel_lower = str(fuel_val).strip().lower()
+    tech_lower = str(tech_val).strip().lower() if tech_val else ""
+
+    if "solar" in fuel_lower:
+        return "SLR"
+    if "biogas" in fuel_lower:
+        return "BIO"
+    if "biomass" in fuel_lower:
+        return "BMS"
+    if "geothermal" in fuel_lower:
+        return "GEO"
+    if "wind" in fuel_lower:
+        return "WND"
+    if "hydro" in fuel_lower:
+        if "dam" in tech_lower:
+            return "LHY"
+        if "run of river" in tech_lower:
+            return "SHYD"
+    return str(fuel_val).strip()
+
+
 def irec_country_to_code(country_val):
     """Take the first 2 characters of the IREC country field."""
     if country_val is None:
@@ -913,6 +951,7 @@ def process_irec_files(irec_file_paths, logger):
             out["Asset"]        = get("Device Name")
             out["Fuel"]         = next((get(a) for a in IREC_FUEL_ALIASES if get(a)), None)
             out["Tech"]         = get("Technology")
+            out["Fuel"]         = map_fuel_code(out["Fuel"], out["Tech"])
             out["Country"]      = irec_country_to_code(get("Country"))
             raw_qty = get("Volume")
             out["Quantity"]     = float(raw_qty) if raw_qty else None
@@ -993,7 +1032,7 @@ def process_tigr_files(tigr_file_paths, logger):
 
             out = {col: None for col in TEMPLATE_COLUMNS}
             out["Registry"]     = "TIGR"
-            out["Fuel"]         = tech_val
+            out["Fuel"]         = map_fuel_code(tech_val, tech_val)
             out["Tech"]         = tech_val
             out["Period Start"] = fmt_date(period_start)
             out["Period End"]   = fmt_date(period_end)
@@ -1117,6 +1156,225 @@ def _load_previous_rows(prev_path, logger):
         return []
 
 
+def _parse_date_for_summary(val):
+    """
+    Parse a date value (string, date, datetime) and return a Python date object.
+    Tries common formats used in the output rows.  Returns None on failure.
+    """
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        return val.date()
+    if isinstance(val, date):
+        return val
+    s = str(val).strip()
+    for fmt in ("%d/%m/%Y", "%m/%d/%Y", "%Y-%m-%d", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _quarter_date_range(year, quarter):
+    """
+    Return (period_start_str, period_end_str) for a given year and quarter.
+    e.g. year=2024, quarter=1  →  ("01/01/2024", "31/03/2024")
+    """
+    q_start_month = (quarter - 1) * 3 + 1
+    q_end_month   = quarter * 3
+    _, last_day   = calendar.monthrange(year, q_end_month)
+    start = date(year, q_start_month, 1)
+    end   = date(year, q_end_month, last_day)
+    return start.strftime("%d/%m/%Y"), end.strftime("%d/%m/%Y")
+
+
+def _write_summary_sheet(wb, all_rows, logger):
+    """
+    Create a 'Summary' sheet that aggregates Quantity by:
+        Registry | Country | Fuel | Quarter Range | Period Start | Period End | Quantity
+
+    Rules:
+    - Each unique (Registry, Country, Fuel, Year, Quarter) combination gets ONE row.
+    - If all rows in a group share the same Registry/Country/Fuel, a TOTAL row is appended.
+    - NO cell is ever left empty — every field is populated with a value (0 for missing qty).
+    - Quarter Range is a human-readable label e.g. "Q1 2024".
+    - Period Start / Period End show the actual start and end dates of that quarter.
+    - Rows whose Period Start cannot be parsed are logged and skipped.
+    """
+    from collections import defaultdict
+
+    SUMMARY_HEADERS = [
+        "Registry", "Country", "Fuel",
+        "Quarter Range", "Period Start", "Period End",
+        "Quantity",
+    ]
+
+    # ── Build aggregation dict ────────────────────────────────────────────────
+    # key: (Registry, Country, Fuel, Year, Quarter) → total qty
+    agg = defaultdict(float)
+
+    skipped = 0
+    for row in all_rows:
+        d = _parse_date_for_summary(row.get("Period Start"))
+        if d is None:
+            skipped += 1
+            continue
+
+        quarter  = (d.month - 1) // 3 + 1
+        year     = d.year
+        registry = str(row.get("Registry") or "").strip() or "Unknown"
+        country  = str(row.get("Country")  or "").strip() or "Unknown"
+        fuel     = str(row.get("Fuel")     or "").strip() or "Unknown"
+
+        try:
+            qty = float(row.get("Quantity") or 0)
+        except (TypeError, ValueError):
+            qty = 0.0
+
+        agg[(registry, country, fuel, year, quarter)] += qty
+
+    if skipped:
+        logger.warning("Summary sheet: %d row(s) skipped (unparseable Period Start).", skipped)
+
+    # ── Sort: Registry → Country → Fuel → Year → Quarter ─────────────────────
+    sorted_keys = sorted(agg.keys(), key=lambda k: (k[0], k[1], k[2], k[3], k[4]))
+
+    # ── Build flat list of display rows ──────────────────────────────────────
+    # Each detail row + a subtotal row per (Registry, Country, Fuel) group
+    display_rows = []   # list of (row_values_list, is_total_row)
+
+    # Group by (Registry, Country, Fuel)
+    from itertools import groupby
+    group_key_fn = lambda k: (k[0], k[1], k[2])
+
+    for (registry, country, fuel), group_iter in groupby(sorted_keys, key=group_key_fn):
+        group_keys = list(group_iter)
+        group_total = 0.0
+        for key in group_keys:
+            _, _, _, year, quarter = key
+            qty = agg[key]
+            group_total += qty
+            q_label       = f"Q{quarter} {year}"
+            ps_str, pe_str = _quarter_date_range(year, quarter)
+            display_rows.append((
+                [registry, country, fuel, q_label, ps_str, pe_str, qty],
+                False,
+            ))
+
+        # Subtotal row for this (Registry, Country, Fuel) — shown only when >1 quarter
+        if len(group_keys) > 1:
+            # Use full year span for the subtotal period
+            years      = sorted({k[3] for k in group_keys})
+            quarters   = sorted({(k[3], k[4]) for k in group_keys})
+            first_yr, first_q = min(quarters)
+            last_yr,  last_q  = max(quarters)
+            ps_str, _  = _quarter_date_range(first_yr, first_q)
+            _, pe_str  = _quarter_date_range(last_yr,  last_q)
+            year_label = f"{min(years)}" if min(years) == max(years) else f"{min(years)}–{max(years)}"
+            q_label    = f"TOTAL {year_label}"
+            display_rows.append((
+                [registry, country, fuel, q_label, ps_str, pe_str, group_total],
+                True,
+            ))
+
+    # ── Create worksheet ──────────────────────────────────────────────────────
+    ws = wb.create_sheet(title="Summary")
+
+    # ── Styles ────────────────────────────────────────────────────────────────
+    header_fill   = PatternFill("solid", fgColor="1F4E79")
+    header_font   = Font(bold=True, color="FFFFFF", size=11, name="Arial")
+    header_align  = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    total_fill    = PatternFill("solid", fgColor="D9E1F2")   # soft blue for subtotal rows
+    total_font    = Font(bold=True, color="1F4E79", size=10, name="Arial")
+
+    fill_a        = PatternFill("solid", fgColor="EAF2FB")   # light blue-grey (even rows)
+    fill_b        = PatternFill("solid", fgColor="FFFFFF")   # white (odd rows)
+
+    data_font     = Font(name="Arial", size=10)
+    num_fmt       = "#,##0.000000"
+    right_align   = Alignment(horizontal="right",  vertical="center")
+    left_align    = Alignment(horizontal="left",   vertical="center")
+    center_align  = Alignment(horizontal="center", vertical="center")
+
+    thin_border = Border(
+        left=Side(style="thin"),  right=Side(style="thin"),
+        top=Side(style="thin"),   bottom=Side(style="thin"),
+    )
+    thick_bottom = Border(
+        left=Side(style="thin"),  right=Side(style="thin"),
+        top=Side(style="thin"),   bottom=Side(style="medium"),
+    )
+
+    # ── Write header row ──────────────────────────────────────────────────────
+    for col_idx, h in enumerate(SUMMARY_HEADERS, start=1):
+        cell           = ws.cell(row=1, column=col_idx, value=h)
+        cell.font      = header_font
+        cell.fill      = header_fill
+        cell.alignment = header_align
+        cell.border    = thin_border
+
+    # ── Write data rows ───────────────────────────────────────────────────────
+    for row_idx, (values, is_total) in enumerate(display_rows, start=2):
+        if is_total:
+            fill   = total_fill
+            font   = total_font
+            border = thick_bottom
+        else:
+            fill   = fill_a if row_idx % 2 == 0 else fill_b
+            font   = data_font
+            border = thin_border
+
+        for col_idx, (h, val) in enumerate(zip(SUMMARY_HEADERS, values), start=1):
+            # Guarantee no empty cell — fallback to 0 for numbers, "—" for text
+            if val is None or val == "":
+                val = 0.0 if h == "Quantity" else "—"
+
+            cell           = ws.cell(row=row_idx, column=col_idx, value=val)
+            cell.font      = font
+            cell.fill      = fill
+            cell.border    = border
+
+            if h == "Quantity":
+                cell.alignment    = right_align
+                cell.number_format = num_fmt
+            elif h in ("Period Start", "Period End"):
+                cell.alignment = center_align
+            elif h == "Quarter Range":
+                cell.alignment = center_align
+                if is_total:
+                    cell.font = Font(bold=True, color="1F4E79", size=10,
+                                     name="Arial", italic=True)
+            else:
+                cell.alignment = left_align
+
+    # ── Column widths ─────────────────────────────────────────────────────────
+    summary_widths = {
+        "Registry":      14,
+        "Country":       10,
+        "Fuel":          14,
+        "Quarter Range": 18,
+        "Period Start":  16,
+        "Period End":    16,
+        "Quantity":      20,
+    }
+    for col_idx, h in enumerate(SUMMARY_HEADERS, start=1):
+        ws.column_dimensions[get_column_letter(col_idx)].width = summary_widths.get(h, 14)
+
+    # ── Row height for header ─────────────────────────────────────────────────
+    ws.row_dimensions[1].height = 30
+
+    ws.freeze_panes = "A2"
+    logger.info("'Summary' sheet written: %d detail row(s), %d group(s)",
+                sum(1 for _, is_t in display_rows if not is_t),
+                sum(1 for _, is_t in display_rows if is_t))
+    print(f"  [i] 'Summary' sheet added: {len(display_rows)} row(s) "
+          f"({sum(1 for _, t in display_rows if not t)} detail + "
+          f"{sum(1 for _, t in display_rows if t)} subtotal).")
+    return ws
+
+
 def write_combined_excel(all_rows, logger):
     """
     Write all rows into a styled Excel file using the hardcoded template columns.
@@ -1124,13 +1382,8 @@ def write_combined_excel(all_rows, logger):
     Behaviour
     ---------
     * The output is always saved as  output/combined_output.xlsx  (fixed name).
-    * If a previous  combined_output.xlsx  already exists in the output folder:
-        - Its data is loaded and written to a sheet named  "Previous"
-          (header in dark grey, rows in muted colours).
-        - The new data is written to a sheet named  "Current"
-          (header in dark blue, rows in the original colours).
-      The "Current" sheet is placed first so it opens by default.
-    * If no previous file exists, only the "Current" sheet is written.
+    * The workbook contains two sheets: "Current" (the fresh data) and "Summary".
+    * Any existing combined_output.xlsx is simply overwritten.
     * After saving, the fixed filename overwrites whatever was there before.
 
     Columns not available in a source remain empty (None → blank cell).
@@ -1153,16 +1406,6 @@ def write_combined_excel(all_rows, logger):
         "Sub-Account ID": 16,
     }
 
-    # ── Load previous data if available ──────────────────────────────────────
-    prev_rows = []
-    if output_path.exists():
-        logger.info("Previous output found → loading for comparison: %s", output_path)
-        print(f"  [i] Previous output found — will add 'Previous' comparison sheet.")
-        prev_rows = _load_previous_rows(output_path, logger)
-    else:
-        logger.info("No previous output found — writing 'Current' sheet only.")
-        print(f"  [i] No previous output found — writing single 'Current' sheet.")
-
     # ── Build workbook ────────────────────────────────────────────────────────
     wb = Workbook()
 
@@ -1172,12 +1415,8 @@ def write_combined_excel(all_rows, logger):
     _apply_sheet_styles(ws_current, all_rows, col_widths, logger, is_previous=False)
     logger.info("'Current' sheet written: %d row(s)", len(all_rows))
 
-    # "Previous" sheet — only when there was an existing file
-    if prev_rows:
-        ws_previous = wb.create_sheet(title="Previous")
-        _apply_sheet_styles(ws_previous, prev_rows, col_widths, logger, is_previous=True)
-        logger.info("'Previous' sheet written: %d row(s)", len(prev_rows))
-        print(f"  [i] 'Previous' sheet added with {len(prev_rows)} row(s) from prior run.")
+    # "Summary" sheet — always last; aggregates Quantity by Registry/Country/Fuel/Year/Quarter
+    _write_summary_sheet(wb, all_rows, logger)
 
     # ── Save (overwrites the fixed filename) ─────────────────────────────────
     wb.save(str(output_path))
