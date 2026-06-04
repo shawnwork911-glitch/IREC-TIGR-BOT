@@ -1,17 +1,10 @@
 name: Combined Bot — IREC + TIGR
-
-# ── Schedule: runs every Monday at 9:00 AM Malaysia time (UTC+8 = 01:00 UTC) ──
-# To change the schedule, edit the cron line below.
-# Cron format: minute hour day month weekday
-# Examples:
-#   '0 1 * * 1'   → Every Monday   9:00 AM MYT
-#   '0 1 * * *'   → Every day      9:00 AM MYT
-#   '0 1 1 * *'   → 1st of month   9:00 AM MYT
+# 5 AM MYT Tue & Thu (= 21:00 UTC Mon & Wed) — primary
+# 7 AM MYT Tue & Thu (= 23:00 UTC Mon & Wed) — backup
 on:
   schedule:
-    - cron: '0 1 * * 1'
-
-  # Also allows you to run it manually from the GitHub Actions tab
+    - cron: '0 21 * * 1,3'   # 5 AM MYT Tue & Thu
+    - cron: '0 23 * * 1,3'   # 7 AM MYT Tue & Thu
   workflow_dispatch:
 
 jobs:
