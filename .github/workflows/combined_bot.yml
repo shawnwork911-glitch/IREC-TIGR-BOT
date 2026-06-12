@@ -1,9 +1,8 @@
 name: Combined Bot — IREC + TIGR
-# 5 AM MYT Tue & Thu (= 21:00 UTC Mon & Wed) — primary
-# 7 AM MYT Tue & Thu (= 23:00 UTC Mon & Wed) — backup
+# 8 AM MYT Tue & Thu (= 21:00 UTC Mon & Wed) — primary
 on:
   schedule:
-    - cron: '0 21 * * 1,3'   # 5 AM MYT Tue & Thu
+    - cron: '0 0 * * 2,4'   # 8 AM MYT Tue & Thu
   workflow_dispatch:
 
 jobs:
