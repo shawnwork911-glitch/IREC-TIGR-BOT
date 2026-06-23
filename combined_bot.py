@@ -42,13 +42,13 @@ def _fatal(msg=""):
     if msg:
         print(msg)
     print("\n" + "=" * 60)
-    input("  Press Enter to close this window...")
+    _pause("  Press Enter to close this window...")
     sys.exit(1)
 
 sys.excepthook = lambda t, v, tb: (
     print("\n[CRASH] An unexpected error occurred:\n"),
     traceback.print_exception(t, v, tb),
-    input("\n  Press Enter to close this window..."),
+    _pause("\n  Press Enter to close this window..."),
 )
 
 # ── Imports ───────────────────────────────────────────────────────────────────
@@ -92,6 +92,12 @@ for d in (DOWNLOAD_DIR, LOG_DIR, SCREENSHOT_DIR, OUTPUT_DIR):
     d.mkdir(exist_ok=True)
 
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
+CI      = os.getenv("CI", "false").lower() == "true"  # set automatically by GitHub Actions
+
+def _pause(msg="  Press Enter to close this window..."):
+    """Pause for user input on desktop; skip silently in CI."""
+    if not CI:
+        input(msg)
 
 # ── Hardcoded Output Template Columns ─────────────────────────────────────────
 TEMPLATE_COLUMNS = [
@@ -505,19 +511,53 @@ def irec_logout(page):
         print("  [!] Log Out button not found — skipping.")
 
 
+def _browser_args() -> list:
+    """
+    Return Chromium launch args that work on both a local desktop and a
+    headless CI/CD runner (GitHub Actions, etc.).
+
+    Key flags
+    ---------
+    --no-sandbox              Required on Linux CI (no user namespace support).
+    --disable-setuid-sandbox  Companion to --no-sandbox.
+    --disable-dev-shm-usage   /dev/shm is tiny on many CI runners; use /tmp instead.
+    --disable-gpu             No GPU on headless servers.
+    --password-store=basic    Tells Chromium NOT to use the OS keychain / kwallet /
+                              gnome-keyring / macOS Keychain for storing passwords.
+                              This is what causes the "confirm password" popup on
+                              laptops and crashes on CI.
+    --use-mock-keychain       macOS: use an in-memory keychain instead of the
+                              system keychain — eliminates the confirmation dialog.
+    --disable-features=...    Disable PasswordManager & AutofillServerCommunication
+                              so Chromium never tries to save/sync credentials.
+    --start-maximized         Only useful in headed mode; harmless in headless mode.
+    """
+    return [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--password-store=basic",
+        "--use-mock-keychain",
+        "--disable-features=PasswordManager,AutofillServerCommunication",
+        "--start-maximized",
+    ]
+
+
 def run_irec(logger):
     banner("BOT 1 — IREC Holdings (evident.app)")
     email, password = irec_validate_env()
 
     saved_files = []
+    _ci_args = _browser_args()
     with sync_playwright() as p:
         browser = p.chromium.launch(
-            headless=False,
-            args=["--start-maximized"],
+            headless=HEADLESS,
+            args=_ci_args,
         )
         context = browser.new_context(
             accept_downloads=True,
-            viewport=None,
+            viewport={"width": 1920, "height": 1080} if HEADLESS else None,
         )
         page    = context.new_page()
 
@@ -1154,16 +1194,17 @@ def run_tigr(logger):
         return []
 
     results = []
+    _ci_args = _browser_args()
     with sync_playwright() as pw:
         browser = pw.chromium.launch(
-            headless=False,
+            headless=HEADLESS,
             slow_mo=TIGR_SLOW_MO,
             downloads_path=str(DOWNLOAD_DIR.resolve()),
-            args=["--start-maximized"],
+            args=_ci_args,
         )
         context = browser.new_context(
             accept_downloads=True,
-            viewport=None,
+            viewport={"width": 1920, "height": 1080} if HEADLESS else None,
         )
         page = context.new_page()
         page.on("console",   lambda m: logger.debug("[browser] %s: %s", m.type, m.text))
@@ -2018,7 +2059,7 @@ def main():
     print(f"\n  Downloads in : {DOWNLOAD_DIR.resolve()}")
     print(f"  Output in    : {OUTPUT_DIR.resolve()}")
     print("=" * 60)
-    input("\n  Press Enter to close this window...")
+    _pause("\n  Press Enter to close this window...")
     sys.exit(0 if all_ok else 1)
 
 
