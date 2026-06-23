@@ -1387,49 +1387,56 @@ def process_irec_files(irec_file_paths, logger):
         "fuel", "fuel type", "energy type", "source",
     ]
 
+    def reformat_date(val):
+        """Convert any recognisable date string to DD/MM/YYYY."""
+        if not val:
+            return val
+        for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d", "%d-%m-%Y"):
+            try:
+                return datetime.strptime(val.strip(), fmt).strftime("%d/%m/%Y")
+            except ValueError:
+                continue
+        return val  # return as-is if format unrecognised
+
     rows = []
     for path in irec_file_paths:
         if path is None or not Path(path).exists():
             logger.warning("IREC file not found, skipping: %s", path)
             continue
         try:
-            df = pd.read_csv(path, dtype=str)
+            # utf-8-sig strips the UTF-8 BOM (\ufeff) that evident.app prepends to
+            # the first column header — without this "Device" becomes "\ufeffDevice"
+            # and _make_getter can never find it, silently producing empty rows.
+            df = pd.read_csv(path, dtype=str, encoding="utf-8-sig")
+            # Also strip any stray whitespace from column names
+            df.columns = [c.strip() for c in df.columns]
             logger.info("IREC file '%s': %d rows, columns: %s", path, len(df), list(df.columns))
         except Exception as exc:
             logger.error("Failed to read IREC file '%s': %s", path, exc)
             continue
 
-        for _, row in df.iterrows():
-            get = _make_getter(row, df.columns)
+        for row_num, (_, row) in enumerate(df.iterrows(), start=2):
+            try:
+                get = _make_getter(row, df.columns)
 
-            period_start = next((get(a) for a in IREC_START_ALIASES if get(a)), None)
-            period_end   = next((get(a) for a in IREC_END_ALIASES   if get(a)), None)
+                period_start = next((get(a) for a in IREC_START_ALIASES if get(a)), None)
+                period_end   = next((get(a) for a in IREC_END_ALIASES   if get(a)), None)
 
-            def reformat_date(val):
-                """Convert any recognisable date string to DD/MM/YYYY."""
-                if not val:
-                    return val
-                from datetime import datetime
-                for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d"):
-                    try:
-                        return datetime.strptime(val.strip(), fmt).strftime("%d/%m/%Y")
-                    except ValueError:
-                        continue
-                return val  # return as-is if unrecognised
-
-            out = {col: None for col in TEMPLATE_COLUMNS}
-            out["Registry"]     = "IREC"
-            out["Asset ID"]     = get("Device")
-            out["Asset"]        = get("Device Name")
-            out["Fuel"]         = next((get(a) for a in IREC_FUEL_ALIASES if get(a)), None)
-            out["Tech"]         = get("Technology")
-            out["Fuel"]         = map_fuel_code(out["Fuel"], out["Tech"])
-            out["Country"]      = irec_country_to_code(get("Country"))
-            raw_qty = get("Volume")
-            out["Quantity"]     = float(raw_qty) if raw_qty else None
-            out["Period Start"] = reformat_date(period_start)
-            out["Period End"]   = reformat_date(period_end)
-            rows.append(out)
+                out = {col: None for col in TEMPLATE_COLUMNS}
+                out["Registry"]     = "IREC"
+                out["Asset ID"]     = get("Device")
+                out["Asset"]        = get("Device Name")
+                out["Fuel"]         = next((get(a) for a in IREC_FUEL_ALIASES if get(a)), None)
+                out["Tech"]         = get("Technology")
+                out["Fuel"]         = map_fuel_code(out["Fuel"], out["Tech"])
+                out["Country"]      = irec_country_to_code(get("Country"))
+                raw_qty             = get("Volume")
+                out["Quantity"]     = float(raw_qty) if raw_qty else None
+                out["Period Start"] = reformat_date(period_start)
+                out["Period End"]   = reformat_date(period_end)
+                rows.append(out)
+            except Exception as exc:
+                logger.warning("IREC: skipping row %d in '%s' due to error: %s", row_num, path, exc)
 
     logger.info("IREC: total rows processed: %d", len(rows))
     return rows
@@ -1459,8 +1466,19 @@ def process_tigr_files(tigr_file_paths, logger):
             continue
 
         try:
-            df = pd.read_csv(path, dtype=str)
+            ext = Path(path).suffix.lower()
+            if ext in (".xlsx", ".xls"):
+                # Find the real header row (TIGR Excel files sometimes have
+                # a title / logo row above the actual column headers)
+                header_row = _find_header_row(
+                    path,
+                    required_keywords=["vintage", "sub-account", "quantity", "country", "fuel"],
+                )
+                df = pd.read_excel(path, header=header_row, dtype=str)
+            else:
+                df = pd.read_csv(path, dtype=str)
             df.dropna(how="all", inplace=True)
+            df.columns = [str(c).strip() for c in df.columns]   # tidy whitespace
             df.reset_index(drop=True, inplace=True)
             logger.info("TIGR file '%s': %d rows, columns: %s", path, len(df), list(df.columns))
         except Exception as exc:
@@ -1929,9 +1947,22 @@ def detect_file_types(csv_paths, logger):
     IREC signature: contains 'device' and 'volume' column headers.
     TIGR signature: contains 'vintage' or 'sub-account' column headers.
     Unrecognised files are logged and skipped.
+
+    Robustness notes
+    ----------------
+    * Read with encoding='utf-8-sig' to strip the UTF-8 BOM (\ufeff) that many
+      web-app CSV exports prepend to the first column header.  Without this,
+      "Device" becomes "\ufeffDevice" and never matches "device".
+    * Headers are stripped of surrounding whitespace AND any leading/trailing
+      non-alphanumeric characters before comparison, as an extra safety net.
+    * IREC_SIGNATURES is expanded to cover 'device name' in case the export
+      omits the plain 'Device' column but keeps 'Device Name'.
+    * The filename itself is used as a last-resort fallback: IREC CSVs are
+      saved as  <label>_holdings.csv  by irec_download_csv().
     """
-    # IREC: has "device" column; TIGR: has "tigr vintage" or "sub-account" column
-    IREC_SIGNATURES = {"device"}
+    # IREC: exported with "Device" and/or "Device Name" columns
+    IREC_SIGNATURES = {"device", "device name"}
+    # TIGR: exported with "TIGR Vintage" or "Sub-Account" columns
     TIGR_SIGNATURES = {"tigr vintage", "sub-account", "vintage", "sub account", "subaccount"}
 
     irec_paths = []
@@ -1939,11 +1970,16 @@ def detect_file_types(csv_paths, logger):
 
     for path in csv_paths:
         try:
-            df_head = pd.read_csv(path, nrows=0, dtype=str)
-            headers = {c.strip().lower() for c in df_head.columns}
+            # utf-8-sig strips the BOM that evident.app / many web apps prepend
+            df_head = pd.read_csv(path, nrows=0, dtype=str, encoding="utf-8-sig")
+            # Strip whitespace AND any leading/trailing non-word chars (e.g. BOM remnants)
+            import re as _re
+            headers = {_re.sub(r'^\W+|\W+$', '', c).strip().lower() for c in df_head.columns}
         except Exception as exc:
             logger.warning("detect_file_types: could not read '%s': %s", path, exc)
             continue
+
+        logger.debug("detect_file_types: '%s' cleaned headers → %s", path, sorted(headers))
 
         if IREC_SIGNATURES & headers:
             logger.info("  → IREC : %s  (headers: %s)", path, list(df_head.columns))
@@ -1951,8 +1987,15 @@ def detect_file_types(csv_paths, logger):
         elif TIGR_SIGNATURES & headers:
             logger.info("  → TIGR : %s  (headers: %s)", path, list(df_head.columns))
             tigr_paths.append(path)
+        elif "_holdings.csv" in str(path).lower():
+            # Filename fallback: irec_download_csv() always saves as <label>_holdings.csv
+            logger.warning(
+                "  → IREC (filename fallback): %s  (headers didn't match known signatures: %s)",
+                path, sorted(headers),
+            )
+            irec_paths.append(path)
         else:
-            logger.warning("  → UNKNOWN (skipped): %s  (headers: %s)", path, list(df_head.columns))
+            logger.warning("  → UNKNOWN (skipped): %s  (headers: %s)", path, sorted(headers))
 
     logger.info("Detected %d IREC and %d TIGR file(s)", len(irec_paths), len(tigr_paths))
     return irec_paths, tigr_paths
@@ -1961,18 +2004,32 @@ def detect_file_types(csv_paths, logger):
 def run_combine(irec_results, tigr_results, logger):
     banner("BOT 3 — Combine Output")
 
-    # ── Scan the downloads folder directly ────────────────────────────────────────────
-    # CSV files → IREC; Excel files (.xlsx / .xls) → TIGR
-    # This is the source of truth regardless of what the bots returned above.
-    all_csvs = sorted([str(p) for p in DOWNLOAD_DIR.glob("*.csv") if p.is_file()])
-    logger.info("Downloads folder scan → %d CSV file(s) found", len(all_csvs))
+    # ── Scan the downloads folder directly ─────────────────────────────────────
+    # IREC downloads are CSV files.
+    # TIGR downloads are Excel files (.xlsx / .xls).
+    # Scan both independently so one missing source does not block the other.
+    all_csvs   = sorted([str(p) for p in DOWNLOAD_DIR.glob("*.csv")  if p.is_file()])
+    all_excels = sorted([str(p) for p in DOWNLOAD_DIR.glob("*.xls*") if p.is_file()])
+    logger.info("Downloads folder scan → %d CSV file(s) + %d Excel file(s)",
+                len(all_csvs), len(all_excels))
 
-    if not all_csvs:
-        logger.warning("No CSV files found in downloads folder: %s", DOWNLOAD_DIR.resolve())
-        print(f"  [!] No CSV files found in {DOWNLOAD_DIR.resolve()} — nothing to combine.")
+    if not all_csvs and not all_excels:
+        logger.warning("No downloadable files in: %s", DOWNLOAD_DIR.resolve())
+        print(f"  [!] No files found in {DOWNLOAD_DIR.resolve()} — nothing to combine.")
         return None
 
-    irec_paths, tigr_paths = detect_file_types(all_csvs, logger)
+    # IREC: classify CSVs by header content (device column = IREC signature)
+    irec_paths, _extra_tigr_csvs = detect_file_types(all_csvs, logger)
+
+    # TIGR: Excel files from the downloads folder
+    tigr_paths = all_excels
+    if _extra_tigr_csvs:
+        # Unexpected TIGR-looking CSVs — include them too (belt-and-braces)
+        tigr_paths = _extra_tigr_csvs + tigr_paths
+        logger.info("TIGR: also including %d CSV file(s) with TIGR signatures", len(_extra_tigr_csvs))
+
+    logger.info("Processing %d IREC CSV(s) and %d TIGR Excel(s)",
+                len(irec_paths), len(tigr_paths))
 
     irec_rows = process_irec_files(irec_paths, logger)
     tigr_rows = process_tigr_files(tigr_paths, logger)
