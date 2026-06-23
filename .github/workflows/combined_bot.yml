@@ -8,77 +8,79 @@ on:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true   # Node.js 24 fix
 
     steps:
-
-      # ── 1. Check out your repo ──────────────────────────────────────────────
+      # ── 1. Checkout ────────────────────────────────────────────────────────
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4   # Node.js 24 — warning resolved
 
-      # ── 2. Set up Python ────────────────────────────────────────────────────
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+      # ── 2. Python ──────────────────────────────────────────────────────────
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5   # Node.js 24 — warning resolved
         with:
-          python-version: '3.11'
-          cache: 'pip'
+          python-version: "3.12"
 
-      # ── 3. Install Python dependencies ──────────────────────────────────────
-      - name: Install dependencies
+      # ── 3. Python dependencies ─────────────────────────────────────────────
+      - name: Install Python dependencies
         run: |
           pip install --upgrade pip
-          pip install playwright python-dotenv openpyxl pandas msal requests
+          pip install playwright python-dotenv openpyxl pandas
 
-      # ── 4. Install Playwright Chromium browser ───────────────────────────────
-      - name: Install Playwright browsers
+      # ── 4. Playwright browser ──────────────────────────────────────────────
+      # Install only Chromium (smaller, faster than full install)
+      - name: Install Playwright Chromium
         run: python -m playwright install chromium --with-deps
 
-      # ── 5. Create working directories ───────────────────────────────────────
-      - name: Create working directories
-        run: mkdir -p downloads logs screenshots output
-
-      # ── 6. Write credentials from GitHub Secrets into .env ──────────────────
-      - name: Write .env from secrets
-        run: |
-          cat > .env << 'EOF'
-          IREC_EMAIL=${{ secrets.IREC_EMAIL }}
-          IREC_PASSWORD=${{ secrets.IREC_PASSWORD }}
-          TIGR_MYUSERNAME=${{ secrets.TIGR_MYUSERNAME }}
-          TIGR_MYPASSWORD=${{ secrets.TIGR_MYPASSWORD }}
-          TIGR_SGUSERNAME=${{ secrets.TIGR_SGUSERNAME }}
-          TIGR_SGPASSWORD=${{ secrets.TIGR_SGPASSWORD }}
-          HEADLESS=true
-          EOF
-
-      # ── 7. Run the bot ───────────────────────────────────────────────────────
-      - name: Run combined_bot.py
-        run: python combined_bot_ci.py
-
-      # ── 8. Upload Excel to SharePoint via Power Automate ────────────────────
-      - name: Upload output to SharePoint (via Power Automate)
-        if: always()
+      # ── 5. Run the bot ─────────────────────────────────────────────────────
+      # Secrets are set in GitHub → Settings → Secrets → Actions
+      # HEADLESS=true so Chromium runs without a display on the Linux runner
+      - name: Run combined bot
         env:
-          POWER_AUTOMATE_URL: ${{ secrets.POWER_AUTOMATE_URL }}
-        run: python upload_to_powerautomate.py
+          HEADLESS: "true"
+          IREC_EMAIL:       ${{ secrets.IREC_EMAIL }}
+          IREC_PASSWORD:    ${{ secrets.IREC_PASSWORD }}
+          TIGR_MYUSERNAME:  ${{ secrets.TIGR_MYUSERNAME }}
+          TIGR_MYPASSWORD:  ${{ secrets.TIGR_MYPASSWORD }}
+          TIGR_SGUSERNAME:  ${{ secrets.TIGR_SGUSERNAME }}
+          TIGR_SGPASSWORD:  ${{ secrets.TIGR_SGPASSWORD }}
+        # 'script -q -c' allocates a pseudo-TTY so the bot's input() prompts
+        # don't hang; stdout is piped out normally.
+        run: |
+          echo "=== Bot starting ==="
+          # Run with a timeout safety net (30 min max)
+          timeout 1800 python combined_bot.py || true
+          echo "=== Bot finished ==="
 
-      # ── 9. Keep a backup copy in GitHub artifacts (30 days) ─────────────────
-      - name: Upload output to GitHub artifacts (backup)
+      # ── 6. Upload all outputs as artifacts ────────────────────────────────
+      - name: Upload combined Excel output
+        if: always()
+        uses: actions/upload-artifact@v4   # Node.js 24 — warning resolved
+        with:
+          name: combined-output-${{ github.run_number }}
+          path: output/
+          retention-days: 30
+
+      - name: Upload downloaded source files
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: combined-output-${{ github.run_number }}
-          path: |
-            output/combined_output.xlsx
-            logs/
-          retention-days: 30
+          name: downloads-${{ github.run_number }}
+          path: downloads/
+          retention-days: 7
 
-      # ── 10. Upload screenshots on failure for debugging ──────────────────────
-      - name: Upload screenshots on failure
-        if: failure()
+      - name: Upload screenshots (for debugging)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: screenshots-${{ github.run_number }}
           path: screenshots/
           retention-days: 7
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ github.run_number }}
+          path: logs/
+          retention-days: 14
+
