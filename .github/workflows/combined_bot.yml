@@ -1,8 +1,8 @@
 name: Combined Bot — IREC + TIGR
-# 2 AM MYT Tue & Thu (= 21:00 UTC Mon & Wed) — primary
+# 18:00 UTC Mon & Wed = 02:00 MYT Tue & Thu
 on:
   schedule:
-    - cron: '0 18 * * 1,3'   # 2 AM MYT Tue & Thu
+    - cron: '0 18 * * 1,3'   # 02:00 MYT Tue & Thu (= 18:00 UTC Mon & Wed)
   workflow_dispatch:
 
 jobs:
@@ -12,11 +12,11 @@ jobs:
     steps:
       # ── 1. Checkout ────────────────────────────────────────────────────────
       - name: Checkout repository
-        uses: actions/checkout@v4   # Node.js 24 — warning resolved
+        uses: actions/checkout@v4
 
       # ── 2. Python ──────────────────────────────────────────────────────────
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5   # Node.js 24 — warning resolved
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
@@ -27,13 +27,13 @@ jobs:
           pip install playwright python-dotenv openpyxl pandas
 
       # ── 4. Playwright browser ──────────────────────────────────────────────
-      # Install only Chromium (smaller, faster than full install)
       - name: Install Playwright Chromium
         run: python -m playwright install chromium --with-deps
 
       # ── 5. Run the bot ─────────────────────────────────────────────────────
       # Secrets are set in GitHub → Settings → Secrets → Actions
       # HEADLESS=true so Chromium runs without a display on the Linux runner
+      # CI=true is set automatically by GitHub Actions — skips input() pauses
       - name: Run combined bot
         env:
           HEADLESS: "true"
@@ -43,18 +43,17 @@ jobs:
           TIGR_MYPASSWORD:  ${{ secrets.TIGR_MYPASSWORD }}
           TIGR_SGUSERNAME:  ${{ secrets.TIGR_SGUSERNAME }}
           TIGR_SGPASSWORD:  ${{ secrets.TIGR_SGPASSWORD }}
-        # 'script -q -c' allocates a pseudo-TTY so the bot's input() prompts
-        # don't hang; stdout is piped out normally.
+        # Run with a 30-minute safety timeout.
+        # Exit code is preserved so the workflow shows red on bot failure.
         run: |
           echo "=== Bot starting ==="
-          # Run with a timeout safety net (30 min max)
-          timeout 1800 python combined_bot.py || true
+          timeout 1800 python combined_bot.py
           echo "=== Bot finished ==="
 
       # ── 6. Upload all outputs as artifacts ────────────────────────────────
       - name: Upload combined Excel output
         if: always()
-        uses: actions/upload-artifact@v4   # Node.js 24 — warning resolved
+        uses: actions/upload-artifact@v4
         with:
           name: combined-output-${{ github.run_number }}
           path: output/
@@ -83,4 +82,3 @@ jobs:
           name: logs-${{ github.run_number }}
           path: logs/
           retention-days: 14
-
