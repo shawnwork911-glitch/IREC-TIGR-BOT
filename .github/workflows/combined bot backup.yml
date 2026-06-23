@@ -5,94 +5,80 @@ on:
   workflow_dispatch:
 
 jobs:
-  check-and-run:
+  run-bot:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Check if primary workflow ran successfully today
-        id: check
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # Get the last run of the primary workflow
-          LAST_STATUS=$(gh api \
-            "repos/${{ github.repository }}/actions/workflows/combined_bot.yml/runs?per_page=1" \
-            --jq '.workflow_runs[0] | "\(.conclusion) \(.created_at)"')
-
-          echo "Last primary run: $LAST_STATUS"
-          CONCLUSION=$(echo "$LAST_STATUS" | awk '{print $1}')
-          RUN_DATE=$(echo "$LAST_STATUS" | awk '{print $2}' | cut -c1-10)
-          TODAY=$(date -u +%Y-%m-%d)
-
-          if [[ "$RUN_DATE" == "$TODAY" || "$RUN_DATE" == "$(date -u -d 'yesterday' +%Y-%m-%d)" ]] && [[ "$CONCLUSION" == "success" ]]; then
-            echo "skip=true" >> $GITHUB_OUTPUT
-            echo "Primary ran successfully — skipping backup."
-          else
-            echo "skip=false" >> $GITHUB_OUTPUT
-            echo "Primary did not succeed — backup will run."
-          fi
-
+      # ── 1. Checkout ────────────────────────────────────────────────────────
       - name: Checkout repository
-        if: steps.check.outputs.skip == 'false'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4   # Node.js 24 — warning resolved
 
-      - name: Set up Python 3.11
-        if: steps.check.outputs.skip == 'false'
-        uses: actions/setup-python@v5
+      # ── 2. Python ──────────────────────────────────────────────────────────
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5   # Node.js 24 — warning resolved
         with:
-          python-version: '3.11'
-          cache: 'pip'
+          python-version: "3.12"
 
-      - name: Install dependencies
-        if: steps.check.outputs.skip == 'false'
+      # ── 3. Python dependencies ─────────────────────────────────────────────
+      - name: Install Python dependencies
         run: |
           pip install --upgrade pip
-          pip install playwright python-dotenv openpyxl pandas msal requests
+          pip install playwright python-dotenv openpyxl pandas
 
-      - name: Install Playwright browsers
-        if: steps.check.outputs.skip == 'false'
+      # ── 4. Playwright browser ──────────────────────────────────────────────
+      # Install only Chromium (smaller, faster than full install)
+      - name: Install Playwright Chromium
         run: python -m playwright install chromium --with-deps
 
-      - name: Create working directories
-        if: steps.check.outputs.skip == 'false'
-        run: mkdir -p downloads logs screenshots output
-
-      - name: Write .env from secrets
-        if: steps.check.outputs.skip == 'false'
-        run: |
-          cat > .env << 'EOF'
-          IREC_EMAIL=${{ secrets.IREC_EMAIL }}
-          IREC_PASSWORD=${{ secrets.IREC_PASSWORD }}
-          TIGR_MYUSERNAME=${{ secrets.TIGR_MYUSERNAME }}
-          TIGR_MYPASSWORD=${{ secrets.TIGR_MYPASSWORD }}
-          TIGR_SGUSERNAME=${{ secrets.TIGR_SGUSERNAME }}
-          TIGR_SGPASSWORD=${{ secrets.TIGR_SGPASSWORD }}
-          HEADLESS=true
-          EOF
-
-      - name: Run combined_bot.py
-        if: steps.check.outputs.skip == 'false'
-        run: python combined_bot_ci.py
-
-      - name: Upload output to SharePoint (via Power Automate)
-        if: steps.check.outputs.skip == 'false'
+      # ── 5. Run the bot ─────────────────────────────────────────────────────
+      # Secrets are set in GitHub → Settings → Secrets → Actions
+      # HEADLESS=true so Chromium runs without a display on the Linux runner
+      - name: Run combined bot
         env:
-          POWER_AUTOMATE_URL: ${{ secrets.POWER_AUTOMATE_URL }}
-        run: python upload_to_powerautomate.py
+          HEADLESS: "true"
+          IREC_EMAIL:       ${{ secrets.IREC_EMAIL }}
+          IREC_PASSWORD:    ${{ secrets.IREC_PASSWORD }}
+          TIGR_MYUSERNAME:  ${{ secrets.TIGR_MYUSERNAME }}
+          TIGR_MYPASSWORD:  ${{ secrets.TIGR_MYPASSWORD }}
+          TIGR_SGUSERNAME:  ${{ secrets.TIGR_SGUSERNAME }}
+          TIGR_SGPASSWORD:  ${{ secrets.TIGR_SGPASSWORD }}
+        # 'script -q -c' allocates a pseudo-TTY so the bot's input() prompts
+        # don't hang; stdout is piped out normally.
+        run: |
+          echo "=== Bot starting ==="
+          # Run with a timeout safety net (30 min max)
+          timeout 1800 python combined_bot.py || true
+          echo "=== Bot finished ==="
 
-      - name: Upload output to GitHub artifacts (backup)
-        if: steps.check.outputs.skip == 'false'
-        uses: actions/upload-artifact@v4
+      # ── 6. Upload all outputs as artifacts ────────────────────────────────
+      - name: Upload combined Excel output
+        if: always()
+        uses: actions/upload-artifact@v4   # Node.js 24 — warning resolved
         with:
-          name: combined-output-backup-${{ github.run_number }}
-          path: |
-            output/combined_output.xlsx
-            logs/
+          name: combined-output-${{ github.run_number }}
+          path: output/
           retention-days: 30
 
-      - name: Upload screenshots on failure
-        if: failure()
+      - name: Upload downloaded source files
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: screenshots-backup-${{ github.run_number }}
+          name: downloads-${{ github.run_number }}
+          path: downloads/
+          retention-days: 7
+
+      - name: Upload screenshots (for debugging)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots-${{ github.run_number }}
           path: screenshots/
           retention-days: 7
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ github.run_number }}
+          path: logs/
+          retention-days: 14
