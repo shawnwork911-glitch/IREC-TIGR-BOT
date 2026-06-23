@@ -577,20 +577,36 @@ def tigr_load_env(logger):
 
 
 def tigr_find_login_frame(page, logger):
-    """Legacy helper — kept for fallback; new login uses tigr_login() directly."""
+    """
+    Locate the frame that contains the TIGR login form.
+
+    Search order (most-specific → most-generic):
+      1. Frame has #myuserid  (TIGR's exact username field id)
+      2. Frame has input[name="myuserid"]
+      3. Frame has input[type="password"]   (generic fallback)
+
+    Username is checked first because the TIGR login page requires
+    the username to be filled before the password field is activated.
+    """
+    username_selectors = [
+        '#myuserid',
+        'input[name="myuserid"]',
+        'input[type="password"]',   # fallback — at minimum a pw field must exist
+    ]
     deadline = time.time() + 15
     while time.time() < deadline:
         for frame in all_frames(page):
-            try:
-                if frame.query_selector('input[type="password"]'):
-                    logger.info("TIGR password input found in frame: %s", frame.url[:80])
-                    return frame
-            except Exception:
-                pass
-        logger.debug("TIGR: no password field yet, waiting 1 s…")
+            for sel in username_selectors:
+                try:
+                    if frame.query_selector(sel):
+                        logger.info("TIGR login frame found via '%s' in: %s", sel, frame.url[:80])
+                        return frame
+                except Exception:
+                    pass
+        logger.debug("TIGR: login form not found yet, waiting 1 s…")
         time.sleep(1)
 
-    logger.error("TIGR: no password input found after 15 s. Frames:")
+    logger.error("TIGR: login form not found after 15 s. Frames present:")
     for f in all_frames(page):
         logger.error("  %s", f.url)
     return None
@@ -632,12 +648,32 @@ def tigr_login(page, username, password, logger):
     screenshot(page, "tigr_02_auth_page", logger)
     logger.info("TIGR: auth page URL: %s", page.url)
 
-    # ── Detect: new multi-step (Auth0) vs old single-page login ───────────────
-    has_email_only = False
+    # ── Detect: TIGR single-page login vs new multi-step (Auth0) login ────────
+    #
+    # TIGR registry (tigrsregistry.apx.com) uses a classic single-page form:
+    #   <input id="myuserid"   name="myuserid"   type="text">    ← username
+    #   <input id="mypassword" name="mypassword"  type="password"> ← password
+    #
+    # The new Xpansiv/Auth0 flow only shows the email field on the first screen
+    # (no password visible until after clicking Continue).
+    #
+    # Detection priority:
+    #   1. If #myuserid is present  → TIGR single-page form  → legacy path
+    #   2. If both a text/email AND a password field exist    → legacy path
+    #   3. Otherwise                                          → stepped path
+    # ─────────────────────────────────────────────────────────────────────────
+    has_tigr_form   = False
     has_both_fields = False
+    has_email_only  = False
 
     for frame in all_frames(page):
         try:
+            # Check for TIGR-specific username field first
+            if frame.query_selector('#myuserid, input[name="myuserid"]'):
+                has_tigr_form = True
+                logger.info("TIGR: detected #myuserid — classic TIGR single-page form.")
+                break
+
             pw_inputs = frame.query_selector_all('input[type="password"]')
             em_inputs = frame.query_selector_all(
                 'input[type="email"], input[name="username"], input[name="email"],'
@@ -645,19 +681,18 @@ def tigr_login(page, username, password, logger):
             )
             if pw_inputs and em_inputs:
                 has_both_fields = True
-                break
-            if em_inputs and not pw_inputs:
+            elif em_inputs and not pw_inputs:
                 has_email_only = True
         except Exception:
             pass
 
-    if has_both_fields:
-        # ── Legacy single-page login (old UI) ─────────────────────────────────
-        logger.info("TIGR: detected single-page login form (old UI) — using legacy path.")
+    if has_tigr_form or has_both_fields:
+        # ── Single-page login (TIGR classic UI) ───────────────────────────────
+        logger.info("TIGR: using legacy single-page login path (username → password → submit).")
         _tigr_legacy_fill(page, username, password, logger)
     else:
         # ── New multi-step login (Auth0 / new Xpansiv UI) ─────────────────────
-        logger.info("TIGR: detected multi-step login (new UI) — using stepped path.")
+        logger.info("TIGR: using stepped multi-step login path (email → continue → password).")
         _tigr_stepped_login(page, username, password, logger)
 
     # ── Verify login success ───────────────────────────────────────────────────
@@ -809,40 +844,101 @@ def _tigr_stepped_login(page, username, password, logger):
 
 
 def _tigr_legacy_fill(page, username, password, logger):
-    """Old single-page login: fill username + password then submit."""
+    """
+    Single-page TIGR login (tigrsregistry.apx.com).
+
+    The TIGR login form uses named fields:
+      <input id="myuserid"   name="myuserid"   type="text">
+      <input id="mypassword" name="mypassword"  type="password">
+      <button type="submit">Login</button>
+
+    The username MUST be filled and confirmed before the password field
+    is touched — matching the page's natural tab order and preventing
+    auto-clear behaviour observed on some browsers.
+
+    Selector priority (username):
+      1. #myuserid           — exact TIGR field id
+      2. input[name="myuserid"]
+      3. input[type="text"]  — generic fallback
+    Selector priority (password):
+      1. #mypassword         — exact TIGR field id
+      2. input[name="mypassword"]
+      3. input[type="password"] — generic fallback
+    """
     frame = tigr_find_login_frame(page, logger)
     if frame is None:
         screenshot(page, "tigr_error_no_login_form", logger)
         raise RuntimeError("TIGR: could not find login form (no password input).")
 
-    text_inputs     = frame.query_selector_all('input[type="text"], input[type="email"], input:not([type])')
-    password_inputs = frame.query_selector_all('input[type="password"]')
+    # ── Step 1: locate and fill USERNAME field ────────────────────────────────
+    u_field = None
+    for u_sel in (
+        '#myuserid',
+        'input[name="myuserid"]',
+        'input[type="text"]',
+        'input[type="email"]',
+        'input[name="username"]',
+        'input[name="email"]',
+    ):
+        try:
+            el = frame.wait_for_selector(u_sel, timeout=5_000, state="visible")
+            if el:
+                u_field = el
+                logger.info("TIGR: username field found via '%s'", u_sel)
+                break
+        except PWTimeout:
+            continue
 
-    if not text_inputs:
-        text_inputs = [
-            el for el in frame.query_selector_all("input")
-            if (el.get_attribute("type") or "text") not in
-               ("password", "submit", "button", "checkbox", "radio", "hidden", "image")
-        ]
-
-    if not text_inputs:
+    if not u_field:
         screenshot(page, "tigr_error_no_username_field", logger)
-        raise RuntimeError("TIGR: no username input found.")
-    if not password_inputs:
-        screenshot(page, "tigr_error_no_password_field", logger)
-        raise RuntimeError("TIGR: no password input found.")
+        raise RuntimeError("TIGR: no username input found on login page.")
 
-    u_field = text_inputs[0]
-    p_field = password_inputs[0]
-    u_field.click(); u_field.fill(""); u_field.type(username, delay=60)
-    p_field.click(); p_field.fill(""); p_field.type(password, delay=60)
+    u_field.click()
+    u_field.fill("")
+    u_field.type(username, delay=60)
+    logger.info("TIGR: username entered: '%s'", username)
+    screenshot(page, "tigr_legacy_01_username_entered", logger)
+
+    # Small pause so the page registers the username before moving to password
+    time.sleep(0.5)
+
+    # ── Step 2: locate and fill PASSWORD field ────────────────────────────────
+    p_field = None
+    for p_sel in (
+        '#mypassword',
+        'input[name="mypassword"]',
+        'input[type="password"]',
+    ):
+        try:
+            el = frame.wait_for_selector(p_sel, timeout=5_000, state="visible")
+            if el:
+                p_field = el
+                logger.info("TIGR: password field found via '%s'", p_sel)
+                break
+        except PWTimeout:
+            continue
+
+    if not p_field:
+        screenshot(page, "tigr_error_no_password_field", logger)
+        raise RuntimeError("TIGR: no password input found on login page.")
+
+    p_field.click()
+    p_field.fill("")
+    p_field.type(password, delay=60)
+    logger.info("TIGR: password entered.")
     screenshot(page, "tigr_legacy_02_credentials_filled", logger)
 
+    # ── Step 3: click Login button / submit ───────────────────────────────────
     login_selectors = [
-        'a:has-text("Login")', 'button:has-text("Login")', 'input[value="Login"]',
-        'a:has-text("Log In")', 'button:has-text("Log In")', 'input[value="Log In"]',
-        'a:has-text("Sign In")', 'button:has-text("Sign In")', 'input[value="Sign In"]',
-        'input[type="submit"]', 'button[type="submit"]', 'button',
+        'button[type="submit"]',        # <button type="submit">Login</button>
+        'button.btn:has-text("Login")',
+        'button:has-text("Login")',
+        'input[value="Login"]',
+        'button:has-text("Log In")',
+        'input[value="Log In"]',
+        'button:has-text("Sign In")',
+        'input[type="submit"]',
+        'button',
     ]
     submitted = False
     for sel in login_selectors:
@@ -859,7 +955,7 @@ def _tigr_legacy_fill(page, username, password, logger):
             logger.warning("TIGR: could not click '%s': %s", sel, exc)
 
     if not submitted:
-        logger.warning("TIGR: no login button found — pressing Enter.")
+        logger.warning("TIGR: no login button found — pressing Enter on password field.")
         p_field.press("Enter")
 
     try:
