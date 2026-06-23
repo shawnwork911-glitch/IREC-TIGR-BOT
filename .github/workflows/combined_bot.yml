@@ -24,7 +24,7 @@ jobs:
       - name: Install Python dependencies
         run: |
           pip install --upgrade pip
-          pip install playwright python-dotenv openpyxl pandas
+          pip install playwright python-dotenv openpyxl pandas requests
 
       # ── 4. Playwright browser ──────────────────────────────────────────────
       - name: Install Playwright Chromium
@@ -50,10 +50,25 @@ jobs:
           timeout 1800 python combined_bot.py
           echo "=== Bot finished ==="
 
-      # ── 6. Upload all outputs as artifacts ────────────────────────────────
+      # ── 6. Upload to SharePoint via Power Automate ─────────────────────────
+      # Runs only if the output file was actually created by the bot.
+      # POWER_AUTOMATE_URL must be added to GitHub → Settings → Secrets → Actions.
+      - name: Upload to SharePoint via Power Automate
+        env:
+          POWER_AUTOMATE_URL: ${{ secrets.POWER_AUTOMATE_URL }}
+        run: |
+          if [ -f "output/combined_output.xlsx" ]; then
+            echo "=== Uploading to SharePoint ==="
+            python upload_to_powerautomate.py
+            echo "=== Upload finished ==="
+          else
+            echo "[SKIP] output/combined_output.xlsx not found — skipping SharePoint upload."
+          fi
+
+      # ── 7. Upload all outputs as artifacts ────────────────────────────────
       - name: Upload combined Excel output
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.6.2   # v4.6.2+ built for Node 24 — no deprecation warnings
         with:
           name: combined-output-${{ github.run_number }}
           path: output/
@@ -61,7 +76,7 @@ jobs:
 
       - name: Upload downloaded source files
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.6.2
         with:
           name: downloads-${{ github.run_number }}
           path: downloads/
@@ -69,7 +84,7 @@ jobs:
 
       - name: Upload screenshots (for debugging)
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.6.2
         with:
           name: screenshots-${{ github.run_number }}
           path: screenshots/
@@ -77,7 +92,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.6.2
         with:
           name: logs-${{ github.run_number }}
           path: logs/
