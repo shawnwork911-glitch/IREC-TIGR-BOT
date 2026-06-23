@@ -223,38 +223,162 @@ def irec_validate_env():
 
 
 def irec_login(page, email, password):
-    step("IREC — Logging in ...")
-    page.goto(IREC_LOGIN_URL, wait_until="networkidle")
+    """
+    New multi-step Xpansiv/Auth0 login for IREC (evident.app).
 
-    for loc, label, err_msg in [
-        ('input[type="email"], input[name="email"], input[placeholder*="email" i]',
-         "email", "[ERROR] IREC email field not found."),
-        ('input[type="password"], input[name="password"]',
-         "password", "[ERROR] IREC password field not found."),
-    ]:
+    The login page (auth.xpansiv.com) now uses a stepped flow:
+      Step 1 — Enter email in  input[name="username"]  then click Continue
+      Step 2 — Enter password  in  input[type="password"]  then click Continue
+      Step 3 — Optional authorise/confirm page → click Continue
+
+    The email field is  name="username" type="text"  (NOT type="email"),
+    which is why the old selector failed.
+    """
+    step("IREC — Logging in (new Xpansiv multi-step) ...")
+    page.goto(IREC_LOGIN_URL, wait_until="domcontentloaded")
+    time.sleep(2)
+    print(f"  [i] Login page loaded → {page.url}")
+
+    # ── Step 1: enter email / username ────────────────────────────────────────
+    # Auth0 ULP uses name="username" with type="text" — NOT type="email"
+    email_sel = (
+        'input[name="username"],'
+        'input[type="email"],'
+        'input[name="email"],'
+        'input[placeholder*="email" i],'
+        'input[placeholder*="Email" i]'
+    )
+    try:
+        ef = page.locator(email_sel).first
+        ef.wait_for(state="visible", timeout=15_000)
+        ef.click()
+        ef.fill("")
+        ef.type(email, delay=60)
+        print("  [✓] Email entered")
+    except PWTimeout:
+        _fatal(
+            "[ERROR] IREC email field not found.\n"
+            "  The login page may have changed — check the URL and page source.\n"
+            f"  Current URL: {page.url}"
+        )
+
+    # Click the Continue button
+    # The actual button is: <button type="submit" name="action" value="default"
+    #   data-action-button-primary="true">Continue</button>
+    try:
+        cont = page.locator(
+            'button[data-action-button-primary="true"],'
+            'button[name="action"][value="default"],'
+            'button._button-login-id,'
+            'button[type="submit"]'
+        ).first
+        cont.wait_for(state="visible", timeout=8_000)
+        cont.click()
+        print("  [✓] Continue clicked (after email)")
+    except PWTimeout:
+        print("  [!] Continue button not found — pressing Enter")
+        ef.press("Enter")
+
+    try:
+        page.wait_for_load_state("networkidle", timeout=20_000)
+    except PWTimeout:
+        pass
+    time.sleep(1.5)
+    print(f"  [i] After email step → {page.url}")
+
+    # ── Step 2: enter password ────────────────────────────────────────────────
+    try:
+        pf = page.locator('input[type="password"]').first
+        pf.wait_for(state="visible", timeout=15_000)
+        pf.click()
+        pf.fill("")
+        pf.type(password, delay=60)
+        print("  [✓] Password entered")
+    except PWTimeout:
+        _fatal(
+            "[ERROR] IREC password field not found after email step.\n"
+            f"  Current URL: {page.url}"
+        )
+
+    # Click Continue / Log In if available — otherwise just press Enter
+    try:
+        cont2 = page.locator(
+            'button[data-action-button-primary="true"],'
+            'button[name="action"][value="default"],'
+            'button._button-login-id,'
+            'button[type="submit"]'
+        ).first
+        cont2.wait_for(state="visible", timeout=3_000)
+        cont2.click()
+        print("  [✓] Continue clicked (after password)")
+    except PWTimeout:
+        print("  [i] No Continue button on password page — pressing Enter")
+        pf.press("Enter")
+
+    try:
+        page.wait_for_load_state("networkidle", timeout=20_000)
+    except PWTimeout:
+        pass
+    time.sleep(1.5)
+    print(f"  [i] After password step → {page.url}")
+
+    # ── Step 3: optional authorise / confirm page ─────────────────────────────
+    try:
+        body_text = page.inner_text("body").lower()
+    except Exception:
+        body_text = ""
+
+    confirm_words = ("accept", "authorize", "authorise", "allow", "confirm")
+    if any(w in body_text for w in confirm_words) and "password" not in body_text:
+        print("  [i] Confirmation page detected — clicking Continue")
         try:
-            f = page.locator(loc).first
-            f.wait_for(state="visible", timeout=10_000)
-            f.fill(email if label == "email" else password)
-            print(f"  [✓] {label.capitalize()} entered")
+            conf_btn = page.locator(
+                'button:has-text("Continue"),'
+                'button:has-text("Accept"),'
+                'button:has-text("Authorize"),'
+                'button:has-text("Authorise"),'
+                'button:has-text("Allow"),'
+                'button[type="submit"],'
+                'input[type="submit"]'
+            ).first
+            conf_btn.wait_for(state="visible", timeout=8_000)
+            conf_btn.click()
+            print("  [✓] Confirmation accepted")
+            try:
+                page.wait_for_load_state("networkidle", timeout=20_000)
+            except PWTimeout:
+                pass
+            time.sleep(1.5)
         except PWTimeout:
-            _fatal(err_msg)
+            print("  [!] Confirmation button not found — continuing anyway")
 
+    # ── Verify login succeeded ────────────────────────────────────────────────
+    # Check for error messages before declaring success
     try:
-        b = page.locator('button[type="submit"], button:has-text("Log in"), button:has-text("Sign in")').first
-        b.wait_for(state="visible", timeout=5_000)
-        b.click()
-        print("  [✓] Submit clicked")
-    except PWTimeout:
-        _fatal("[ERROR] IREC submit button not found.")
+        body_text = page.inner_text("body").lower()
+    except Exception:
+        body_text = ""
 
-    try:
-        page.wait_for_url(lambda url: "/login" not in url, timeout=15_000)
-        print(f"  [✓] Logged in → {page.url}")
-    except PWTimeout:
-        err = page.locator('[class*="error"],[class*="alert"],[role="alert"]')
-        msg = err.first.text_content().strip() if err.count() > 0 else "no error text visible"
-        _fatal(f"[FAILED] IREC login rejected: {msg}\nCheck IREC_EMAIL / IREC_PASSWORD in .env.")
+    for bad in ("wrong email or password", "invalid credentials", "login failed",
+                "access denied", "authentication failed"):
+        if bad in body_text:
+            _fatal(
+                f"[FAILED] IREC login rejected: page says '{bad}'\n"
+                "  Check IREC_EMAIL / IREC_PASSWORD in .env."
+            )
+
+    # If still on an auth/login URL after all steps, something went wrong
+    current = page.url
+    if "auth." in current and "/login" in current:
+        err_el = page.locator('[class*="error"],[class*="alert"],[role="alert"]')
+        msg = err_el.first.text_content().strip() if err_el.count() > 0 else "unknown error"
+        _fatal(
+            f"[FAILED] IREC login did not redirect away from auth page.\n"
+            f"  URL: {current}\n  Message: {msg}\n"
+            "  Check IREC_EMAIL / IREC_PASSWORD in .env."
+        )
+
+    print(f"  [✓] Logged in → {page.url}")
 
 
 def irec_go_to_accounts(page):
@@ -387,8 +511,14 @@ def run_irec(logger):
 
     saved_files = []
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=HEADLESS)
-        context = browser.new_context(accept_downloads=True)
+        browser = p.chromium.launch(
+            headless=False,
+            args=["--start-maximized"],
+        )
+        context = browser.new_context(
+            accept_downloads=True,
+            viewport=None,
+        )
         page    = context.new_page()
 
         irec_login(page, email, password)
@@ -412,10 +542,11 @@ def run_irec(logger):
 #  BOT 2 — TIGR Registry (tigrsregistry.apx.com)
 # ═════════════════════════════════════════════════════════════════════════════
 
-TIGR_URL     = "https://tigrsregistry.apx.com/mymodule/mypage.asp"
-TIGR_TIMEOUT = 30_000
-TIGR_NAV_TO  = 60_000
-TIGR_SLOW_MO = 300
+TIGR_URL          = "https://tigrsregistry.apx.com/mymodule/mypage.asp"
+TIGR_LOGIN_BUTTON = "https://tigrsregistry.apx.com"   # landing page with "LOGIN TO REGISTRY"
+TIGR_TIMEOUT      = 30_000
+TIGR_NAV_TO       = 60_000
+TIGR_SLOW_MO      = 300
 
 
 def tigr_load_env(logger):
@@ -446,6 +577,7 @@ def tigr_load_env(logger):
 
 
 def tigr_find_login_frame(page, logger):
+    """Legacy helper — kept for fallback; new login uses tigr_login() directly."""
     deadline = time.time() + 15
     while time.time() < deadline:
         for frame in all_frames(page):
@@ -464,15 +596,220 @@ def tigr_find_login_frame(page, logger):
     return None
 
 
+def _tigr_click_button(page, selectors, label, logger, timeout=10_000):
+    """Click the first matching visible button/link across all frames."""
+    for sel in selectors:
+        for frame in all_frames(page):
+            try:
+                el = frame.wait_for_selector(sel, timeout=timeout, state="visible")
+                if el:
+                    el.click()
+                    logger.info("TIGR: clicked '%s' via selector '%s'", label, sel)
+                    return True
+            except PWTimeout:
+                continue
+            except Exception as exc:
+                logger.debug("TIGR: sel='%s' frame='%s' error: %s", sel, frame.url[:60], exc)
+    return False
+
+
 def tigr_login(page, username, password, logger):
-    logger.info("TIGR STEP 1 — Opening %s", TIGR_URL)
-    page.goto(TIGR_URL, timeout=TIGR_NAV_TO, wait_until="domcontentloaded")
-    logger.info("TIGR page title: %s", page.title())
-    screenshot(page, "tigr_01_opened", logger)
-
-    logger.info("TIGR STEP 2 — Logging in as '%s'", username)
+    """
+    New multi-step Xpansiv/Auth0 login flow:
+      1. Open the TIGR landing page and click "LOGIN TO REGISTRY"
+      2. Enter email address and click Continue
+      3. Enter password and click Continue
+      4. If a "Continue" confirmation page appears, click Continue again
+    Falls back to legacy single-page login if the new flow is not detected.
+    """
+    # ── Step 1: open landing page ─────────────────────────────────────────────
+    logger.info("TIGR STEP 1 — Opening landing page: %s", TIGR_LOGIN_BUTTON)
+    page.goto(TIGR_LOGIN_BUTTON, timeout=TIGR_NAV_TO, wait_until="domcontentloaded")
     time.sleep(2)
+    logger.info("TIGR page title: %s | URL: %s", page.title(), page.url)
+    screenshot(page, "tigr_01_landing", logger)
 
+    screenshot(page, "tigr_02_auth_page", logger)
+    logger.info("TIGR: auth page URL: %s", page.url)
+
+    # ── Detect: new multi-step (Auth0) vs old single-page login ───────────────
+    has_email_only = False
+    has_both_fields = False
+
+    for frame in all_frames(page):
+        try:
+            pw_inputs = frame.query_selector_all('input[type="password"]')
+            em_inputs = frame.query_selector_all(
+                'input[type="email"], input[name="username"], input[name="email"],'
+                'input[placeholder*="email" i]'
+            )
+            if pw_inputs and em_inputs:
+                has_both_fields = True
+                break
+            if em_inputs and not pw_inputs:
+                has_email_only = True
+        except Exception:
+            pass
+
+    if has_both_fields:
+        # ── Legacy single-page login (old UI) ─────────────────────────────────
+        logger.info("TIGR: detected single-page login form (old UI) — using legacy path.")
+        _tigr_legacy_fill(page, username, password, logger)
+    else:
+        # ── New multi-step login (Auth0 / new Xpansiv UI) ─────────────────────
+        logger.info("TIGR: detected multi-step login (new UI) — using stepped path.")
+        _tigr_stepped_login(page, username, password, logger)
+
+    # ── Verify login success ───────────────────────────────────────────────────
+    logger.info("TIGR: post-login URL: %s", page.url)
+    screenshot(page, "tigr_05_after_login", logger)
+    try:
+        body = page.inner_text("body").lower()
+    except Exception:
+        body = ""
+    for phrase in ("invalid username", "invalid password", "incorrect password",
+                   "login failed", "authentication failed", "access denied",
+                   "wrong email or password", "wrong password"):
+        if phrase in body:
+            screenshot(page, "tigr_error_login_failed", logger)
+            raise RuntimeError(
+                f"TIGR login failed — page says '{phrase}'. "
+                "Check TIGR_MYUSERNAME / TIGR_MYPASSWORD in .env."
+            )
+    logger.info("TIGR: login successful.")
+
+
+def _tigr_stepped_login(page, username, password, logger):
+    """Handle new Auth0-style multi-step login: email → password → optional continue."""
+
+    # ── Step A: enter email ────────────────────────────────────────────────────
+    logger.info("TIGR AUTH: Step A — entering email/username")
+    email_selectors = [
+        'input[type="email"]',
+        'input[name="username"]',
+        'input[name="email"]',
+        'input[placeholder*="email" i]',
+        'input[placeholder*="username" i]',
+    ]
+    email_field = None
+    for sel in email_selectors:
+        for frame in all_frames(page):
+            try:
+                el = frame.wait_for_selector(sel, timeout=5_000, state="visible")
+                if el:
+                    email_field = el
+                    logger.info("TIGR: email field found via '%s'", sel)
+                    break
+            except PWTimeout:
+                continue
+        if email_field:
+            break
+
+    if not email_field:
+        screenshot(page, "tigr_error_no_email_field", logger)
+        raise RuntimeError("TIGR: could not find the email/username input on the login page.")
+
+    email_field.click()
+    email_field.fill("")
+    email_field.type(username, delay=60)
+    screenshot(page, "tigr_03a_email_entered", logger)
+
+    # Click the Continue/Next button after email
+    continue_selectors = [
+        'button[type="submit"]',
+        'button:has-text("Continue")',
+        'button:has-text("Next")',
+        'input[type="submit"]',
+        'input[value="Continue"]',
+        'input[value="Next"]',
+    ]
+    if not _tigr_click_button(page, continue_selectors, "Continue (after email)", logger):
+        logger.warning("TIGR: no Continue button — pressing Enter.")
+        email_field.press("Enter")
+
+    try:
+        page.wait_for_load_state("networkidle", timeout=TIGR_NAV_TO)
+    except PWTimeout:
+        logger.warning("TIGR: networkidle timeout after email step.")
+    time.sleep(1.5)
+    screenshot(page, "tigr_03b_after_email_continue", logger)
+    logger.info("TIGR: after email step URL: %s", page.url)
+
+    # ── Step B: enter password ─────────────────────────────────────────────────
+    logger.info("TIGR AUTH: Step B — entering password")
+    pw_field = None
+    deadline = time.time() + 15
+    while time.time() < deadline and pw_field is None:
+        for frame in all_frames(page):
+            try:
+                el = frame.wait_for_selector('input[type="password"]', timeout=3_000, state="visible")
+                if el:
+                    pw_field = el
+                    logger.info("TIGR: password field found in frame: %s", frame.url[:80])
+                    break
+            except PWTimeout:
+                continue
+        if not pw_field:
+            time.sleep(1)
+
+    if not pw_field:
+        screenshot(page, "tigr_error_no_password_field", logger)
+        raise RuntimeError("TIGR: password input not found after email step.")
+
+    pw_field.click()
+    pw_field.fill("")
+    pw_field.type(password, delay=60)
+    screenshot(page, "tigr_04a_password_entered", logger)
+
+    # Click Continue/Login after password
+    if not _tigr_click_button(page, continue_selectors + [
+        'button:has-text("Login")', 'button:has-text("Log In")',
+        'button:has-text("Sign In")', 'input[value="Login"]',
+    ], "Continue (after password)", logger):
+        logger.warning("TIGR: no Continue/Login button — pressing Enter.")
+        pw_field.press("Enter")
+
+    try:
+        page.wait_for_load_state("networkidle", timeout=TIGR_NAV_TO)
+    except PWTimeout:
+        logger.warning("TIGR: networkidle timeout after password step.")
+    time.sleep(1.5)
+    screenshot(page, "tigr_04b_after_password_continue", logger)
+    logger.info("TIGR: after password step URL: %s", page.url)
+
+    # ── Step C: optional "Continue" confirmation page ─────────────────────────
+    # Auth0 sometimes shows a page asking to confirm/authorise the app
+    try:
+        body = page.inner_text("body").lower()
+    except Exception:
+        body = ""
+
+    confirm_phrases = ("accept", "authorize", "authorise", "allow", "continue", "confirm")
+    if any(ph in body for ph in confirm_phrases) and "password" not in body:
+        logger.info("TIGR: detected confirmation/authorise page — clicking Continue.")
+        confirm_selectors = [
+            'button:has-text("Continue")',
+            'button:has-text("Accept")',
+            'button:has-text("Authorize")',
+            'button:has-text("Authorise")',
+            'button:has-text("Allow")',
+            'button[type="submit"]',
+            'input[type="submit"]',
+        ]
+        if _tigr_click_button(page, confirm_selectors, "Confirm/Continue", logger):
+            try:
+                page.wait_for_load_state("networkidle", timeout=TIGR_NAV_TO)
+            except PWTimeout:
+                logger.warning("TIGR: networkidle timeout after confirmation step.")
+            time.sleep(1.5)
+            screenshot(page, "tigr_04c_after_confirmation", logger)
+            logger.info("TIGR: after confirmation URL: %s", page.url)
+        else:
+            logger.warning("TIGR: confirmation page detected but no button found — continuing.")
+
+
+def _tigr_legacy_fill(page, username, password, logger):
+    """Old single-page login: fill username + password then submit."""
     frame = tigr_find_login_frame(page, logger)
     if frame is None:
         screenshot(page, "tigr_error_no_login_form", logger)
@@ -499,7 +836,7 @@ def tigr_login(page, username, password, logger):
     p_field = password_inputs[0]
     u_field.click(); u_field.fill(""); u_field.type(username, delay=60)
     p_field.click(); p_field.fill(""); p_field.type(password, delay=60)
-    screenshot(page, "tigr_02_credentials_filled", logger)
+    screenshot(page, "tigr_legacy_02_credentials_filled", logger)
 
     login_selectors = [
         'a:has-text("Login")', 'button:has-text("Login")', 'input[value="Login"]',
@@ -529,23 +866,6 @@ def tigr_login(page, username, password, logger):
         page.wait_for_load_state("networkidle", timeout=TIGR_NAV_TO)
     except PWTimeout:
         logger.warning("TIGR: networkidle timeout after login, continuing…")
-
-    logger.info("TIGR: after login URL: %s", page.url)
-    screenshot(page, "tigr_03_after_login", logger)
-
-    try:
-        body = page.inner_text("body").lower()
-    except Exception:
-        body = ""
-    for phrase in ("invalid username", "invalid password", "incorrect password",
-                   "login failed", "authentication failed", "access denied"):
-        if phrase in body:
-            screenshot(page, "tigr_error_login_failed", logger)
-            raise RuntimeError(
-                f"TIGR login failed — page says '{phrase}'. "
-                "Check TIGR_MYUSERNAME / TIGR_MYPASSWORD in .env."
-            )
-    logger.info("TIGR: login successful.")
 
 
 def tigr_click_reports(page, logger):
@@ -706,6 +1026,20 @@ def tigr_run_account(page, label, username, password, logger):
     logger.info("━" * 60)
 
     tigr_login(page, username, password, logger)
+
+    # After Auth0 login the browser may land on the Xpansiv home page rather
+    # than the TIGR app page.  Navigate there explicitly if needed.
+    if TIGR_URL not in page.url:
+        logger.info("TIGR: navigating to app page: %s", TIGR_URL)
+        page.goto(TIGR_URL, timeout=TIGR_NAV_TO, wait_until="domcontentloaded")
+        try:
+            page.wait_for_load_state("networkidle", timeout=TIGR_NAV_TO)
+        except PWTimeout:
+            logger.warning("TIGR: networkidle timeout navigating to app page.")
+        time.sleep(1)
+        logger.info("TIGR: app page loaded — URL: %s", page.url)
+        screenshot(page, "tigr_06_app_page", logger)
+
     tigr_click_reports(page, logger)
     tigr_click_sub_accounts(page, logger)
     tigr_click_active(page, logger)
@@ -726,13 +1060,14 @@ def run_tigr(logger):
     results = []
     with sync_playwright() as pw:
         browser = pw.chromium.launch(
-            headless=HEADLESS,
+            headless=False,
             slow_mo=TIGR_SLOW_MO,
             downloads_path=str(DOWNLOAD_DIR.resolve()),
+            args=["--start-maximized"],
         )
         context = browser.new_context(
             accept_downloads=True,
-            viewport={"width": 1280, "height": 900},
+            viewport=None,
         )
         page = context.new_page()
         page.on("console",   lambda m: logger.debug("[browser] %s: %s", m.type, m.text))
