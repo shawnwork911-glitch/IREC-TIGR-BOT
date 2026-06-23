@@ -1189,16 +1189,31 @@ def _quarter_date_range(year, quarter):
     return start.strftime("%d/%m/%Y"), end.strftime("%d/%m/%Y")
 
 
+def _period_range_label(start_date, end_date):
+    """
+    Format a human-readable period range label.
+    e.g. date(2026,1,1), date(2026,6,30) → "Jan 26 - Jun 26"
+    Accepts date objects or (year, month) tuples.
+    """
+    if isinstance(start_date, tuple):
+        start_date = date(start_date[0], start_date[1], 1)
+    if isinstance(end_date, tuple):
+        end_date = date(end_date[0], end_date[1], 1)
+    s = start_date.strftime("%b %y")   # e.g. "Jan 26"
+    e = end_date.strftime("%b %y")     # e.g. "Jun 26"
+    return f"{s} - {e}"
+
+
 def _write_summary_sheet(wb, all_rows, logger):
     """
     Create a 'Summary' sheet that aggregates Quantity by:
-        Registry | Country | Fuel | Quarter Range | Period Start | Period End | Quantity
+        Registry | Country | Fuel | Period Range | Period Start | Period End | Quantity
 
     Rules:
     - Each unique (Registry, Country, Fuel, Year, Quarter) combination gets ONE row.
     - If all rows in a group share the same Registry/Country/Fuel, a TOTAL row is appended.
     - NO cell is ever left empty — every field is populated with a value (0 for missing qty).
-    - Quarter Range is a human-readable label e.g. "Q1 2024".
+    - Period Range is a human-readable label e.g. "Jan 26 - Mar 26".
     - Period Start / Period End show the actual start and end dates of that quarter.
     - Rows whose Period Start cannot be parsed are logged and skipped.
     """
@@ -1206,12 +1221,13 @@ def _write_summary_sheet(wb, all_rows, logger):
 
     SUMMARY_HEADERS = [
         "Registry", "Country", "Fuel",
-        "Quarter Range", "Period Start", "Period End",
+        "Period Range", "Period Start", "Period End",
         "Quantity",
     ]
 
     # ── Build aggregation dict ────────────────────────────────────────────────
     # key: (Registry, Country, Fuel, Year, Quarter) → total qty
+    # Period Range label format: "Jan 26 - Mar 26" (period start – period end)
     agg = defaultdict(float)
 
     skipped = 0
@@ -1255,10 +1271,15 @@ def _write_summary_sheet(wb, all_rows, logger):
             _, _, _, year, quarter = key
             qty = agg[key]
             group_total += qty
-            q_label       = f"Q{quarter} {year}"
             ps_str, pe_str = _quarter_date_range(year, quarter)
+            q_start_month  = (quarter - 1) * 3 + 1
+            q_end_month    = quarter * 3
+            period_label   = _period_range_label(
+                date(year, q_start_month, 1),
+                date(year, q_end_month,   1),
+            )
             display_rows.append((
-                [registry, country, fuel, q_label, ps_str, pe_str, qty],
+                [registry, country, fuel, period_label, ps_str, pe_str, qty],
                 False,
             ))
 
@@ -1271,8 +1292,13 @@ def _write_summary_sheet(wb, all_rows, logger):
             last_yr,  last_q  = max(quarters)
             ps_str, _  = _quarter_date_range(first_yr, first_q)
             _, pe_str  = _quarter_date_range(last_yr,  last_q)
-            year_label = f"{min(years)}" if min(years) == max(years) else f"{min(years)}–{max(years)}"
-            q_label    = f"TOTAL {year_label}"
+            first_start_month = (first_q - 1) * 3 + 1
+            last_end_month    = last_q * 3
+            period_label = _period_range_label(
+                date(first_yr, first_start_month, 1),
+                date(last_yr,  last_end_month,    1),
+            )
+            q_label    = f"TOTAL {period_label}"
             display_rows.append((
                 [registry, country, fuel, q_label, ps_str, pe_str, group_total],
                 True,
@@ -1341,7 +1367,7 @@ def _write_summary_sheet(wb, all_rows, logger):
                 cell.number_format = num_fmt
             elif h in ("Period Start", "Period End"):
                 cell.alignment = center_align
-            elif h == "Quarter Range":
+            elif h == "Period Range":
                 cell.alignment = center_align
                 if is_total:
                     cell.font = Font(bold=True, color="1F4E79", size=10,
@@ -1351,13 +1377,13 @@ def _write_summary_sheet(wb, all_rows, logger):
 
     # ── Column widths ─────────────────────────────────────────────────────────
     summary_widths = {
-        "Registry":      14,
-        "Country":       10,
-        "Fuel":          14,
-        "Quarter Range": 18,
-        "Period Start":  16,
-        "Period End":    16,
-        "Quantity":      20,
+        "Registry":     14,
+        "Country":      10,
+        "Fuel":         14,
+        "Period Range": 20,
+        "Period Start": 16,
+        "Period End":   16,
+        "Quantity":     20,
     }
     for col_idx, h in enumerate(SUMMARY_HEADERS, start=1):
         ws.column_dimensions[get_column_letter(col_idx)].width = summary_widths.get(h, 14)
