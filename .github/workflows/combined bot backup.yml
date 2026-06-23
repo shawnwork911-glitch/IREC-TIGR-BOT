@@ -11,11 +11,11 @@ jobs:
     steps:
       # ── 1. Checkout ────────────────────────────────────────────────────────
       - name: Checkout repository
-        uses: actions/checkout@v4   # Node.js 24 — warning resolved
+        uses: actions/checkout@v4
 
       # ── 2. Python ──────────────────────────────────────────────────────────
       - name: Set up Python 3.12
-        uses: actions/setup-python@v5   # Node.js 24 — warning resolved
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
@@ -23,16 +23,16 @@ jobs:
       - name: Install Python dependencies
         run: |
           pip install --upgrade pip
-          pip install playwright python-dotenv openpyxl pandas
+          pip install playwright python-dotenv openpyxl pandas requests
 
       # ── 4. Playwright browser ──────────────────────────────────────────────
-      # Install only Chromium (smaller, faster than full install)
       - name: Install Playwright Chromium
         run: python -m playwright install chromium --with-deps
 
       # ── 5. Run the bot ─────────────────────────────────────────────────────
       # Secrets are set in GitHub → Settings → Secrets → Actions
       # HEADLESS=true so Chromium runs without a display on the Linux runner
+      # CI=true is set automatically by GitHub Actions — skips input() pauses
       - name: Run combined bot
         env:
           HEADLESS: "true"
@@ -42,18 +42,32 @@ jobs:
           TIGR_MYPASSWORD:  ${{ secrets.TIGR_MYPASSWORD }}
           TIGR_SGUSERNAME:  ${{ secrets.TIGR_SGUSERNAME }}
           TIGR_SGPASSWORD:  ${{ secrets.TIGR_SGPASSWORD }}
-        # 'script -q -c' allocates a pseudo-TTY so the bot's input() prompts
-        # don't hang; stdout is piped out normally.
+        # Run with a 30-minute safety timeout.
+        # Exit code is preserved so the workflow shows red on bot failure.
         run: |
           echo "=== Bot starting ==="
-          # Run with a timeout safety net (30 min max)
-          timeout 1800 python combined_bot.py || true
+          timeout 1800 python combined_bot.py
           echo "=== Bot finished ==="
 
-      # ── 6. Upload all outputs as artifacts ────────────────────────────────
+      # ── 6. Upload to SharePoint via Power Automate ─────────────────────────
+      # Runs only if the output file was actually created by the bot.
+      # POWER_AUTOMATE_URL must be added to GitHub → Settings → Secrets → Actions.
+      - name: Upload to SharePoint via Power Automate
+        env:
+          POWER_AUTOMATE_URL: ${{ secrets.POWER_AUTOMATE_URL }}
+        run: |
+          if [ -f "output/combined_output.xlsx" ]; then
+            echo "=== Uploading to SharePoint ==="
+            python upload_to_powerautomate.py
+            echo "=== Upload finished ==="
+          else
+            echo "[SKIP] output/combined_output.xlsx not found — skipping SharePoint upload."
+          fi
+
+      # ── 7. Upload all outputs as artifacts ────────────────────────────────
       - name: Upload combined Excel output
         if: always()
-        uses: actions/upload-artifact@v4   # Node.js 24 — warning resolved
+        uses: actions/upload-artifact@v4.6.2   # v4.6.2+ built for Node 24 — no deprecation warnings
         with:
           name: combined-output-${{ github.run_number }}
           path: output/
@@ -61,7 +75,7 @@ jobs:
 
       - name: Upload downloaded source files
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.6.2
         with:
           name: downloads-${{ github.run_number }}
           path: downloads/
@@ -69,7 +83,7 @@ jobs:
 
       - name: Upload screenshots (for debugging)
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.6.2
         with:
           name: screenshots-${{ github.run_number }}
           path: screenshots/
@@ -77,7 +91,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4.6.2
         with:
           name: logs-${{ github.run_number }}
           path: logs/
