@@ -211,7 +211,11 @@ IREC_LOGIN_URL = "https://evident.app/login"
 IREC_TARGET_ACCOUNTS = [
     ("SAXONTRADE01",  "SAXONTRADE01", "SaxonTrade01",             "SaxonTrade01",                  False),
     ("FRG",           "T0LFRGI4",     "Saxon Renewables Pte Ltd", "SaxonRenewablesPteLtd_T0LFRGI4", False),
+    ("t9mq",          "T9MQ5BR4",     "SAXONTRADE02",              "TADAU_T9MQ",                     False),
 ]
+
+# File label prefix that identifies the TADAU account download
+TADAU_LABEL_PREFIX = "TADAU_"
 
 
 def irec_validate_env():
@@ -1773,26 +1777,7 @@ def _write_summary_sheet(wb, all_rows, logger):
                 False,
             ))
 
-        # Subtotal row for this (Registry, Country, Fuel) — shown only when >1 quarter
-        if len(group_keys) > 1:
-            # Use full year span for the subtotal period
-            years      = sorted({k[3] for k in group_keys})
-            quarters   = sorted({(k[3], k[4]) for k in group_keys})
-            first_yr, first_q = min(quarters)
-            last_yr,  last_q  = max(quarters)
-            ps_str, _  = _quarter_date_range(first_yr, first_q)
-            _, pe_str  = _quarter_date_range(last_yr,  last_q)
-            first_start_month = (first_q - 1) * 3 + 1
-            last_end_month    = last_q * 3
-            period_label = _period_range_label(
-                date(first_yr, first_start_month, 1),
-                date(last_yr,  last_end_month,    1),
-            )
-            q_label    = f"TOTAL {period_label}"
-            display_rows.append((
-                [registry, country, fuel, q_label, ps_str, pe_str, group_total],
-                True,
-            ))
+
 
     # ── Create worksheet ──────────────────────────────────────────────────────
     ws = wb.create_sheet(title="Summary")
@@ -1882,25 +1867,23 @@ def _write_summary_sheet(wb, all_rows, logger):
     ws.row_dimensions[1].height = 30
 
     ws.freeze_panes = "A2"
-    logger.info("'Summary' sheet written: %d detail row(s), %d group(s)",
-                sum(1 for _, is_t in display_rows if not is_t),
-                sum(1 for _, is_t in display_rows if is_t))
-    print(f"  [i] 'Summary' sheet added: {len(display_rows)} row(s) "
-          f"({sum(1 for _, t in display_rows if not t)} detail + "
-          f"{sum(1 for _, t in display_rows if t)} subtotal).")
+    logger.info("'Summary' sheet written: %d row(s)", len(display_rows))
+    print(f"  [i] 'Summary' sheet added: {len(display_rows)} row(s).")
     return ws
 
 
-def write_combined_excel(all_rows, logger):
+def write_combined_excel(all_rows, logger, tadau_rows=None):
     """
     Write all rows into a styled Excel file using the hardcoded template columns.
 
     Behaviour
     ---------
     * The output is always saved as  output/combined_output.xlsx  (fixed name).
-    * The workbook contains two sheets: "Current" (the fresh data) and "Summary".
+    * The workbook contains:
+        - "Current"  — main combined data (IREC + TIGR, excluding TADAU)
+        - "TADAU"    — data from the T9MQ/TADAU account (if any)
+        - "Summary"  — aggregates Quantity by Registry/Country/Fuel/Year/Quarter
     * Any existing combined_output.xlsx is simply overwritten.
-    * After saving, the fixed filename overwrites whatever was there before.
 
     Columns not available in a source remain empty (None → blank cell).
     """
@@ -1930,6 +1913,15 @@ def write_combined_excel(all_rows, logger):
     ws_current.title = "Current"
     _apply_sheet_styles(ws_current, all_rows, col_widths, logger, is_previous=False)
     logger.info("'Current' sheet written: %d row(s)", len(all_rows))
+
+    # "TADAU" sheet — data from the T9MQ account (separate, not merged into Current)
+    if tadau_rows:
+        ws_tadau = wb.create_sheet(title="TADAU")
+        _apply_sheet_styles(ws_tadau, tadau_rows, col_widths, logger, is_previous=False)
+        logger.info("'TADAU' sheet written: %d row(s)", len(tadau_rows))
+        print(f"  [i] 'TADAU' sheet added: {len(tadau_rows)} row(s).")
+    else:
+        logger.info("'TADAU' sheet skipped — no TADAU rows found.")
 
     # "Summary" sheet — always last; aggregates Quantity by Registry/Country/Fuel/Year/Quarter
     _write_summary_sheet(wb, all_rows, logger)
@@ -2019,7 +2011,12 @@ def run_combine(irec_results, tigr_results, logger):
         return None
 
     # IREC: classify CSVs by header content (device column = IREC signature)
-    irec_paths, _extra_tigr_csvs = detect_file_types(all_csvs, logger)
+    irec_paths_all, _extra_tigr_csvs = detect_file_types(all_csvs, logger)
+
+    # Split IREC paths into regular vs TADAU by filename prefix
+    tadau_paths = [p for p in irec_paths_all if Path(p).name.startswith(TADAU_LABEL_PREFIX)]
+    irec_paths  = [p for p in irec_paths_all if not Path(p).name.startswith(TADAU_LABEL_PREFIX)]
+    logger.info("IREC paths split → %d regular, %d TADAU", len(irec_paths), len(tadau_paths))
 
     # TIGR: Excel files from the downloads folder
     tigr_paths = all_excels
@@ -2028,21 +2025,23 @@ def run_combine(irec_results, tigr_results, logger):
         tigr_paths = _extra_tigr_csvs + tigr_paths
         logger.info("TIGR: also including %d CSV file(s) with TIGR signatures", len(_extra_tigr_csvs))
 
-    logger.info("Processing %d IREC CSV(s) and %d TIGR Excel(s)",
-                len(irec_paths), len(tigr_paths))
+    logger.info("Processing %d IREC CSV(s), %d TADAU CSV(s) and %d TIGR Excel(s)",
+                len(irec_paths), len(tadau_paths), len(tigr_paths))
 
-    irec_rows = process_irec_files(irec_paths, logger)
-    tigr_rows = process_tigr_files(tigr_paths, logger)
+    irec_rows  = process_irec_files(irec_paths,  logger)
+    tadau_rows = process_irec_files(tadau_paths, logger)
+    tigr_rows  = process_tigr_files(tigr_paths,  logger)
 
     all_rows = irec_rows + tigr_rows
-    logger.info("Total rows to write: %d (%d IREC + %d TIGR)", len(all_rows), len(irec_rows), len(tigr_rows))
+    logger.info("Total rows to write: %d (%d IREC + %d TIGR) + %d TADAU (separate sheet)",
+                len(all_rows), len(irec_rows), len(tigr_rows), len(tadau_rows))
 
-    if not all_rows:
+    if not all_rows and not tadau_rows:
         logger.warning("No data rows to write — skipping Excel output.")
         print("  [!] No data to combine. Check that downloads succeeded.")
         return None
 
-    return write_combined_excel(all_rows, logger)
+    return write_combined_excel(all_rows, logger, tadau_rows=tadau_rows or None)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
