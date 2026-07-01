@@ -212,10 +212,14 @@ IREC_TARGET_ACCOUNTS = [
     ("SAXONTRADE01",  "SAXONTRADE01", "SaxonTrade01",             "SaxonTrade01",                  False),
     ("FRG",           "T0LFRGI4",     "Saxon Renewables Pte Ltd", "SaxonRenewablesPteLtd_T0LFRGI4", False),
     ("t9mq",          "T9MQ5BR4",     "SAXONTRADE02",              "TADAU_T9MQ",                     False),
+    ("T0CV1BYF",      "T0CV1BYF",     "IS Energy Sdn Bhd",         "ISENERGY_T0CV1BYF",              False),
 ]
 
 # File label prefix that identifies the TADAU account download
 TADAU_LABEL_PREFIX = "TADAU_"
+
+# File label prefix that identifies the IS Energy account download
+ISENERGY_LABEL_PREFIX = "ISENERGY_"
 
 
 def irec_validate_env():
@@ -1872,7 +1876,7 @@ def _write_summary_sheet(wb, all_rows, logger):
     return ws
 
 
-def write_combined_excel(all_rows, logger, tadau_rows=None):
+def write_combined_excel(all_rows, logger, tadau_rows=None, isenergy_rows=None):
     """
     Write all rows into a styled Excel file using the hardcoded template columns.
 
@@ -1880,9 +1884,10 @@ def write_combined_excel(all_rows, logger, tadau_rows=None):
     ---------
     * The output is always saved as  output/combined_output.xlsx  (fixed name).
     * The workbook contains:
-        - "Current"  — main combined data (IREC + TIGR, excluding TADAU)
-        - "TADAU"    — data from the T9MQ/TADAU account (if any)
-        - "Summary"  — aggregates Quantity by Registry/Country/Fuel/Year/Quarter
+        - "Current"   — main combined data (IREC + TIGR, excluding TADAU / IS Energy)
+        - "TADAU"     — data from the T9MQ/TADAU account (if any)
+        - "IS Energy" — data from the IS Energy Sdn Bhd (T0CV1BYF) account (if any)
+        - "Summary"   — aggregates Quantity by Registry/Country/Fuel/Year/Quarter
     * Any existing combined_output.xlsx is simply overwritten.
 
     Columns not available in a source remain empty (None → blank cell).
@@ -1922,6 +1927,15 @@ def write_combined_excel(all_rows, logger, tadau_rows=None):
         print(f"  [i] 'TADAU' sheet added: {len(tadau_rows)} row(s).")
     else:
         logger.info("'TADAU' sheet skipped — no TADAU rows found.")
+
+    # "IS Energy" sheet — data from the IS Energy Sdn Bhd (T0CV1BYF) account (separate, not merged into Current)
+    if isenergy_rows:
+        ws_isenergy = wb.create_sheet(title="IS Energy")
+        _apply_sheet_styles(ws_isenergy, isenergy_rows, col_widths, logger, is_previous=False)
+        logger.info("'IS Energy' sheet written: %d row(s)", len(isenergy_rows))
+        print(f"  [i] 'IS Energy' sheet added: {len(isenergy_rows)} row(s).")
+    else:
+        logger.info("'IS Energy' sheet skipped — no IS Energy rows found.")
 
     # "Summary" sheet — always last; aggregates Quantity by Registry/Country/Fuel/Year/Quarter
     _write_summary_sheet(wb, all_rows, logger)
@@ -2013,10 +2027,14 @@ def run_combine(irec_results, tigr_results, logger):
     # IREC: classify CSVs by header content (device column = IREC signature)
     irec_paths_all, _extra_tigr_csvs = detect_file_types(all_csvs, logger)
 
-    # Split IREC paths into regular vs TADAU by filename prefix
-    tadau_paths = [p for p in irec_paths_all if Path(p).name.startswith(TADAU_LABEL_PREFIX)]
-    irec_paths  = [p for p in irec_paths_all if not Path(p).name.startswith(TADAU_LABEL_PREFIX)]
-    logger.info("IREC paths split → %d regular, %d TADAU", len(irec_paths), len(tadau_paths))
+    # Split IREC paths into regular vs TADAU vs IS Energy by filename prefix
+    tadau_paths    = [p for p in irec_paths_all if Path(p).name.startswith(TADAU_LABEL_PREFIX)]
+    isenergy_paths = [p for p in irec_paths_all if Path(p).name.startswith(ISENERGY_LABEL_PREFIX)]
+    irec_paths     = [p for p in irec_paths_all
+                       if not Path(p).name.startswith(TADAU_LABEL_PREFIX)
+                       and not Path(p).name.startswith(ISENERGY_LABEL_PREFIX)]
+    logger.info("IREC paths split → %d regular, %d TADAU, %d IS Energy",
+                len(irec_paths), len(tadau_paths), len(isenergy_paths))
 
     # TIGR: Excel files from the downloads folder
     tigr_paths = all_excels
@@ -2025,23 +2043,28 @@ def run_combine(irec_results, tigr_results, logger):
         tigr_paths = _extra_tigr_csvs + tigr_paths
         logger.info("TIGR: also including %d CSV file(s) with TIGR signatures", len(_extra_tigr_csvs))
 
-    logger.info("Processing %d IREC CSV(s), %d TADAU CSV(s) and %d TIGR Excel(s)",
-                len(irec_paths), len(tadau_paths), len(tigr_paths))
+    logger.info("Processing %d IREC CSV(s), %d TADAU CSV(s), %d IS Energy CSV(s) and %d TIGR Excel(s)",
+                len(irec_paths), len(tadau_paths), len(isenergy_paths), len(tigr_paths))
 
-    irec_rows  = process_irec_files(irec_paths,  logger)
-    tadau_rows = process_irec_files(tadau_paths, logger)
-    tigr_rows  = process_tigr_files(tigr_paths,  logger)
+    irec_rows     = process_irec_files(irec_paths,     logger)
+    tadau_rows    = process_irec_files(tadau_paths,    logger)
+    isenergy_rows = process_irec_files(isenergy_paths, logger)
+    tigr_rows     = process_tigr_files(tigr_paths,     logger)
 
     all_rows = irec_rows + tigr_rows
-    logger.info("Total rows to write: %d (%d IREC + %d TIGR) + %d TADAU (separate sheet)",
-                len(all_rows), len(irec_rows), len(tigr_rows), len(tadau_rows))
+    logger.info("Total rows to write: %d (%d IREC + %d TIGR) + %d TADAU (separate sheet) + %d IS Energy (separate sheet)",
+                len(all_rows), len(irec_rows), len(tigr_rows), len(tadau_rows), len(isenergy_rows))
 
-    if not all_rows and not tadau_rows:
+    if not all_rows and not tadau_rows and not isenergy_rows:
         logger.warning("No data rows to write — skipping Excel output.")
         print("  [!] No data to combine. Check that downloads succeeded.")
         return None
 
-    return write_combined_excel(all_rows, logger, tadau_rows=tadau_rows or None)
+    return write_combined_excel(
+        all_rows, logger,
+        tadau_rows=tadau_rows or None,
+        isenergy_rows=isenergy_rows or None,
+    )
 
 
 # ═════════════════════════════════════════════════════════════════════════════
