@@ -1705,13 +1705,16 @@ def _period_range_label(start_date, end_date):
 def _write_summary_sheet(wb, all_rows, logger):
     """
     Create a 'Summary' sheet that aggregates Quantity by:
-        Registry | Country | Fuel | Period Range | Period Start | Period End | Quantity
+        Registry | Country | Fuel | Production Start Month | Production Start Year |
+        Production End Month | Production End Year | Period Start | Period End | Quantity
 
     Rules:
     - Each unique (Registry, Country, Fuel, Year, Quarter) combination gets ONE row.
     - If all rows in a group share the same Registry/Country/Fuel, a TOTAL row is appended.
     - NO cell is ever left empty — every field is populated with a value (0 for missing qty).
-    - Period Range is a human-readable label e.g. "Jan 26 - Mar 26".
+    - Production Start Month/Year and Production End Month/Year are derived from
+      that quarter's Period Start and Period End dates (e.g. Period Start = 01/01/2026
+      → Production Start Month = "Jan", Production Start Year = 2026).
     - Period Start / Period End show the actual start and end dates of that quarter.
     - Rows whose Period Start cannot be parsed are logged and skipped.
     """
@@ -1719,13 +1722,17 @@ def _write_summary_sheet(wb, all_rows, logger):
 
     SUMMARY_HEADERS = [
         "Registry", "Country", "Fuel",
-        "Period Range", "Period Start", "Period End",
+        "Production Start Month", "Production Start Year",
+        "Production End Month", "Production End Year",
+        "Period Start", "Period End",
         "Quantity",
     ]
 
     # ── Build aggregation dict ────────────────────────────────────────────────
     # key: (Registry, Country, Fuel, Year, Quarter) → total qty
-    # Period Range label format: "Jan 26 - Mar 26" (period start – period end)
+    # Production Start/End Month & Year are derived from the quarter's
+    # Period Start / Period End dates (e.g. Period Start = 01/01/2026 →
+    # Production Start Month = "Jan", Production Start Year = 2026).
     agg = defaultdict(float)
 
     skipped = 0
@@ -1772,12 +1779,19 @@ def _write_summary_sheet(wb, all_rows, logger):
             ps_str, pe_str = _quarter_date_range(year, quarter)
             q_start_month  = (quarter - 1) * 3 + 1
             q_end_month    = quarter * 3
-            period_label   = _period_range_label(
-                date(year, q_start_month, 1),
-                date(year, q_end_month,   1),
-            )
+            start_date_obj = date(year, q_start_month, 1)
+            end_date_obj   = date(year, q_end_month,   1)
+
+            prod_start_month = start_date_obj.strftime("%b")
+            prod_start_year  = start_date_obj.year
+            prod_end_month   = end_date_obj.strftime("%b")
+            prod_end_year    = end_date_obj.year
+
             display_rows.append((
-                [registry, country, fuel, period_label, ps_str, pe_str, qty],
+                [registry, country, fuel,
+                 prod_start_month, prod_start_year,
+                 prod_end_month, prod_end_year,
+                 ps_str, pe_str, qty],
                 False,
             ))
 
@@ -1846,7 +1860,8 @@ def _write_summary_sheet(wb, all_rows, logger):
                 cell.number_format = num_fmt
             elif h in ("Period Start", "Period End"):
                 cell.alignment = center_align
-            elif h == "Period Range":
+            elif h in ("Production Start Month", "Production Start Year",
+                       "Production End Month", "Production End Year"):
                 cell.alignment = center_align
                 if is_total:
                     cell.font = Font(bold=True, color="1F4E79", size=10,
@@ -1856,13 +1871,16 @@ def _write_summary_sheet(wb, all_rows, logger):
 
     # ── Column widths ─────────────────────────────────────────────────────────
     summary_widths = {
-        "Registry":     14,
-        "Country":      10,
-        "Fuel":         14,
-        "Period Range": 20,
-        "Period Start": 16,
-        "Period End":   16,
-        "Quantity":     20,
+        "Registry":                14,
+        "Country":                 10,
+        "Fuel":                    14,
+        "Production Start Month":  16,
+        "Production Start Year":   16,
+        "Production End Month":    16,
+        "Production End Year":     16,
+        "Period Start":            16,
+        "Period End":              16,
+        "Quantity":                20,
     }
     for col_idx, h in enumerate(SUMMARY_HEADERS, start=1):
         ws.column_dimensions[get_column_letter(col_idx)].width = summary_widths.get(h, 14)
