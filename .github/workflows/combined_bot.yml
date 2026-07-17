@@ -1,8 +1,8 @@
 name: Combined Bot — IREC + TIGR
-# 18:00 UTC Mon & Wed = 02:00 MYT Tue & Thu
+# 22:00 UTC every day = 06:00 MYT the next day (daily run)
 on:
   schedule:
-    - cron: '0 18 * * 1,3'   # 02:00 MYT Tue & Thu (= 18:00 UTC Mon & Wed)
+    - cron: '0 22 * * *'   # 06:00 MYT daily (= 22:00 UTC the day before)
   workflow_dispatch:
 
 jobs:
