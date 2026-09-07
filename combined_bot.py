@@ -1406,6 +1406,47 @@ def process_irec_files(irec_file_paths, logger):
                 continue
         return val  # return as-is if format unrecognised
 
+    def expand_to_full_year_if_cross_quarter(start_str, end_str, row_num, path):
+        """
+        If Period Start and Period End (both DD/MM/YYYY strings) fall in the
+        same quarter, leave them unchanged. If Period End falls outside the
+        quarter that Period Start belongs to (i.e. the range spans more than
+        one quarter), expand the range to the whole calendar year:
+            Period Start → 01/01/{year}
+            Period End   → 31/12/{year}
+        Assumes Period Start and Period End are always in the same year.
+        Returns (start_str, end_str) — possibly unchanged.
+        """
+        if not start_str or not end_str:
+            return start_str, end_str
+
+        try:
+            d_start = datetime.strptime(start_str, "%d/%m/%Y").date()
+            d_end   = datetime.strptime(end_str, "%d/%m/%Y").date()
+        except ValueError:
+            logger.warning(
+                "IREC row %d in '%s': could not parse Period Start/End "
+                "('%s' / '%s') for quarter check — leaving as-is.",
+                row_num, path, start_str, end_str,
+            )
+            return start_str, end_str
+
+        q_start = (d_start.month - 1) // 3 + 1
+        q_end   = (d_end.month - 1) // 3 + 1
+
+        if q_start == q_end and d_start.year == d_end.year:
+            return start_str, end_str  # within same quarter — no change
+
+        year = d_start.year
+        new_start = date(year, 1, 1).strftime("%d/%m/%Y")
+        new_end   = date(year, 12, 31).strftime("%d/%m/%Y")
+        logger.info(
+            "IREC row %d in '%s': Period Start/End (%s → %s) spans beyond "
+            "quarter Q%d — expanding to full year %d (%s → %s).",
+            row_num, path, start_str, end_str, q_start, year, new_start, new_end,
+        )
+        return new_start, new_end
+
     rows = []
     for path in irec_file_paths:
         if path is None or not Path(path).exists():
@@ -1442,6 +1483,9 @@ def process_irec_files(irec_file_paths, logger):
                 out["Quantity"]     = float(raw_qty) if raw_qty else None
                 out["Period Start"] = reformat_date(period_start)
                 out["Period End"]   = reformat_date(period_end)
+                out["Period Start"], out["Period End"] = expand_to_full_year_if_cross_quarter(
+                    out["Period Start"], out["Period End"], row_num, path,
+                )
                 rows.append(out)
             except Exception as exc:
                 logger.warning("IREC: skipping row %d in '%s' due to error: %s", row_num, path, exc)
