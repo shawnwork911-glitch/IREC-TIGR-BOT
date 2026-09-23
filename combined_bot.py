@@ -1299,7 +1299,7 @@ def map_fuel_code(fuel_val, tech_val=None):
         Geothermal   → GEO
         Wind         → WND
         Hydro-electric + Tech contains "Dam"          → LHY
-        Hydro-electric + Tech contains "Run of river" → SHYD
+        Hydro-electric + Tech contains "Run of river" → SHY
 
     Returns the original value unchanged if no rule matches.
     """
@@ -1322,7 +1322,7 @@ def map_fuel_code(fuel_val, tech_val=None):
         if "dam" in tech_lower:
             return "LHY"
         if "run of river" in tech_lower:
-            return "SHYD"
+            return "SHY"
     return str(fuel_val).strip()
 
 
